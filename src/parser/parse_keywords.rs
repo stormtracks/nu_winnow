@@ -14,10 +14,11 @@ use crate::ast::{Block, Expression};
 use crate::error::Diagnostic;
 use crate::input::{ParseResult, cut};
 use crate::lex::{Token, TokenContents};
+use crate::span::Span;
 
 use super::WorkingSet;
 use super::parse_calls::parse_call;
-use super::parse_expressions::parse_block_body;
+use super::parse_expressions::{ExpectedShape, is_typed_record, parse_block_body, parse_brace_record, parse_value};
 use super::tokens::Tokens;
 
 /// Keywords that start a statement and can only appear at the head of a
@@ -210,6 +211,17 @@ impl<'t, 'a> KeywordCall<'t, 'a> {
         parse_help_call(self.statement)
     }
 
+    /// [`Self::help_call`] without `dropped`, an item nu never looks at (the
+    /// second brace of `def foo [] {}{} --help`), which is recorded as ignored.
+    pub fn help_call_without(self, dropped: &Token) -> ParseResult<Expression<'a>> {
+        let working_set = self.statement.working_set;
+        let items: Vec<Token> =
+            self.statement.remaining().iter().filter(|token| token.span != dropped.span).copied().collect();
+        let call = parse_help_call(Tokens::new(working_set, &items, self.statement.end_span().start))?;
+        working_set.add_ignored(dropped.span);
+        Ok(call)
+    }
+
     /// The finished statement, unless a `--help` turned it into a call.
     pub fn finish(self, expression: Expression<'a>) -> ParseResult<Expression<'a>> {
         if self.help { self.help_call() } else { Ok(expression) }
@@ -222,6 +234,48 @@ pub fn parse_help_call<'a>(statement: Tokens<'_, 'a>) -> ParseResult<Expression<
         statement.working_set.remove_ignored_from(span.start);
     }
     parse_call(statement)
+}
+
+/// A `{` item where a keyword wants a block or a closure (`what`) but nu
+/// reads a record or a cell path on one ([`parse_brace_record`]). nu then
+/// type-checks it: a record typed `record<...>` is neither (`if true {a: 1}`),
+/// anything typed `any` passes (`if true { $env.A:b }`, `try {a: 1}.a`).
+/// `None` when the item is a block or closure after all.
+pub fn parse_brace_value<'a>(
+    working_set: &WorkingSet<'a>,
+    span: Span,
+    what: &'static str,
+) -> ParseResult<Option<Expression<'a>>> {
+    match parse_brace_record(working_set, span)? {
+        Some(value) if is_typed_record(&value) => {
+            Err(cut(Diagnostic::expected(what, span).with_help("found a record")))
+        }
+        value => Ok(value),
+    }
+}
+
+/// The block a keyword command takes (`if`, `while`, `loop`, `try`, `for`),
+/// or, as nu-parser's `Block` shape allows, a variable, a subexpression or a
+/// brace value ([`parse_brace_value`]) in its place, which nu type-checks as
+/// a block (`if $c $env.f`). The block is empty when a value is returned.
+pub fn parse_block_or_value_argument<'a>(
+    working_set: &WorkingSet<'a>,
+    token: &Token,
+    what: &'static str,
+) -> ParseResult<(Block<'a>, Option<Box<Expression<'a>>>)> {
+    match working_set.get_span_contents(token.span).as_bytes().first() {
+        Some(b'$' | b'(') if token.contents == TokenContents::Item => {
+            let value = parse_value(working_set, token.span, ExpectedShape::Any)?;
+            Ok((Block { span: token.span, pipelines: Vec::new() }, Some(Box::new(value))))
+        }
+        Some(b'{') if token.contents == TokenContents::Item => {
+            match parse_brace_value(working_set, token.span, what)? {
+                Some(value) => Ok((Block { span: token.span, pipelines: Vec::new() }, Some(Box::new(value)))),
+                None => Ok((parse_block_argument(working_set, token, what)?, None)),
+            }
+        }
+        _ => Ok((parse_block_argument(working_set, token, what)?, None)),
+    }
 }
 
 /// The `{ ... }` item a statement takes as its block, or an error.

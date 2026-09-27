@@ -130,8 +130,13 @@ Do not confuse it with `Tokens::next_token` (the token stream's
 ## The top-level loop
 
 `lex_n_tokens` calls `next_token` until the text or the token budget runs
-out, then appends `Eof`. `next_token` skips whitespace and calls `lex_token`,
-which dispatches on the next character with winnow's `dispatch!`:
+out, then appends `Eof`. On the way it keeps the one piece of state nu's lexer
+keeps between tokens (`is_complete`): a `;` after a `|` with only newlines and
+comments between them is "extra tokens" (`ls |; ls`, `ls |\n\n; ls`, and
+`{|x|; 1}`, whose parameter list ends with a plain `|`); an item, including a
+redirection pipe such as `e>|`, ends that state, and `||` never starts it.
+`next_token` skips whitespace and calls `lex_token`, which dispatches on the
+next character with winnow's `dispatch!`:
 
 ```rust,ignore
 fn lex_token(input: &mut Input<'_>, options: LexOptions) -> ParseResult<Option<Token>> {

@@ -13,7 +13,8 @@ Block 0..143
           BinaryOp > 28..34
             Var $x 28..30
             Int 0 33..34
-        Call `pos` 38..41
+        ExternalCall 38..41
+          String Bare "pos" 38..41
       Arm 44..73
         Pattern $x 44..46
         Guard
@@ -24,7 +25,8 @@ Block 0..143
                   Var $x 51..53
                   Int 2 58..59
             Int 0 64..65
-        Call `even` 69..73
+        ExternalCall 69..73
+          String Bare "even" 69..73
       Arm 76..116
         Pattern $x 76..78
         Guard
@@ -37,9 +39,11 @@ Block 0..143
             BinaryOp == 98..105
               Var $y 98..100
               Int 1 104..105
-        Call `complex` 109..116
+        ExternalCall 109..116
+          String Bare "complex" 109..116
       Arm 119..140
         Pattern _ 119..120
         Guard
           Bool true 124..128
-        Call `fallback` 132..140
+        ExternalCall 132..140
+          String Bare "fallback" 132..140

@@ -66,7 +66,14 @@ pub fn parse_value<'a>(
 
 Statement bodies (`if`, `for`, `while`, ...) do not go through `parse_value`
 at all: `parse_block_argument` (in `parse_keywords.rs`) calls
-`parse_block_body` directly, which rejects a leading `|`.
+`parse_block_body` directly, which rejects a leading `|`. One probe comes
+first, because nu makes it before it looks at the shape: when the second
+token of the text between the braces (a tail such as `.a` included) is `:`,
+the item is a record or a cell path on one (`parse_brace_record`). nu then
+type-checks it against the block, and only a record whose keys are all plain
+strings has a type (`is_typed_record`); anything else is `any` and passes, so
+`if true { $env.A:b }` and `try {a: 1}.a` parse while `if true {a: 1}` is
+"expected block" (`parse_brace_value`).
 
 `parse_any_value` tries, in nu's order: `null`/`true`/`false`, binary
 (`parse_binary`: `0x[`, `0o[`, `0b[`), range (only if `is_range_syntax` says
@@ -273,6 +280,13 @@ with "the `..` operator does not work on a string".
 So `{ print hi }` in argument position is a closure, `{}` is a record, and
 `if true { }` gets a block.
 
+An item with text after its closing brace (`{a: 1}.a`) is decided the way nu
+decides it, from the text between its first and last character, tail
+included: a record (`key :`) or a first token `}` (`{}.a`, `{ }.a`) is a cell
+path on a record (`parse_full_cell_path`); anything else would be a
+closure, block or record that never closes, so `{#a: 1}.a` (the interior is
+one comment) and `{...$r}.a` are unclosed delimiters, as in nu.
+
 Three functions parse the body:
 
 * `parse_block_body` is what a statement wants (`if`, `for`, `while`,
@@ -283,12 +297,14 @@ Three functions parse the body:
   It is the body of a `def`: nu parses that as a closure before it knows what
   it wants, so `def f [] {a: 1}` is a call to `a:` and `def f [] {|x| }`
   keeps its parameters (`Def::body_params`, chapter 05).
-* `parse_closure_expression` / `parse_closure_parts` lex the body with
-  `BLOCK`, take a leading `|...|` as the parameter list (parsed by
-  `parse_signature_helper` on the text between the pipes, chapter 07) or `||`
-  as empty parameters, and parse the rest with `parse_block` between
-  `working_set.enter_scope()` and `working_set.exit_scope()`. The parameter
-  list may start on a later line than the `{`.
+* `parse_closure_parts` lexes the body with `BLOCK` and takes a
+  parameter list only where nu does: the first token, or a `|` right after one
+  newline (nu's lexer merges them), is `|...|` (parsed by
+  `parse_signature_helper` with the pipes included, chapter 07) or `||` (empty
+  parameters). After a comment line or a blank line the pipes belong to the
+  body (`{\n# c\n|x| 1}` is `x | 1`, and `{\n|| 1}` is `||` in a block). The
+  rest is parsed with `parse_block` between `working_set.enter_scope()` and
+  `working_set.exit_scope()`.
 
 ## Lists, tables, records
 

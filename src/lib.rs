@@ -33,7 +33,7 @@ pub mod pretty;
 pub mod span;
 
 pub use error::{Diagnostic, ErrorKind, ParseError};
-pub use parser::ParseConfig;
+pub use parser::{CommandType, ParseConfig};
 pub use span::{LineCol, LineIndex, Span, Spanned};
 
 use ast::Ast;

@@ -9,8 +9,10 @@ file that parses the same things.
 
 `parse_signature(working_set, span, external)` accepts a `[...]` or `(...)`
 item; `parse_signature_helper(working_set, inner, outer, external)` is the
-shared worker also used for closure parameter lists (`|x, y|`), where
-`inner` is the text between the pipes and `outer` the span including them.
+shared worker also used for closure parameter lists (`|x, y|`), where, as in
+nu, the text is lexed with its pipes: the closing pipe is then the last token,
+so a trailing `=` or `:` is not (`{|x=| }` and `{|x:| }` parse, while
+`def f [x=] {}` is "expected default value").
 `external` is set for an `extern`, whose parameters declare no variables: nu
 then checks no reserved names and never parses default values
 (`extern foo [x = 0x]` parses; the default token is recorded through
@@ -179,9 +181,14 @@ arm = pattern { "|" pattern } [ "if" guard-items... ] "=>" body
   ``repeat(0.., preceded(pipe, expected("pattern after `|`", pattern)))``;
   two or more alternatives become `Pattern::Or`.
 * `opt(parse_match_guard)`: `keyword("if")`, then `tokens_until("=>")`; the
-  guard is every item up to `=>`, parsed with `parse_math_expression`.
+  guard is every token up to `=>`, read as an item (as nu reads them by
+  their text: `$a if ; => 1` has the guard `;`), parsed with
+  `parse_math_expression`.
 * ``expected("`=>`", keyword("=>"))``.
-* `parse_match_arm_body`: the body is **one item**. A `{ ... }` is parsed
+* `parse_match_arm_body`: the body is **one token**, whatever its kind
+  (`1 => |` and `1 => ;` are calls to commands named `|` and `;`, as in nu;
+  an assignment operator is refused). A word that lexes as an operator or a
+  redirection is an ordinary pattern word (`= => 1`). A `{ ... }` is parsed
   with `ExpectedShape::MatchArmBody` (so it is a block, or a record if it
   looks like one, or a closure if it starts with `|`), anything else with
   `parse_expression`, which means `=> print hi` makes `hi` the start of the

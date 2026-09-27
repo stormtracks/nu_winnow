@@ -13,7 +13,7 @@ use crate::span::{Span, Spanned};
 
 use super::WorkingSet;
 use super::parse_expressions::{ExpectedShape, parse_value};
-use super::parse_helpers::is_identifier;
+use super::parse_helpers::{declared_variable_name, is_identifier, is_variable};
 use super::parse_literals::parse_string_literal;
 use super::parse_shape_specs::{parse_shape_name, parse_type};
 use super::tokens::{Tokens, cut_with, item, keyword, repeat_to_end};
@@ -391,13 +391,20 @@ pub fn parse_full_signature<'a>(
 /// pair               = type "->" type
 /// ```
 fn parse_input_output_types<'a>(working_set: &WorkingSet<'a>, span: Span) -> ParseResult<Vec<InputOutputType<'a>>> {
+    // Like nu, a leading `[` and a trailing `]` are dropped independently, so
+    // `nothing -> nothing]` is one pair.
     let text = working_set.get_span_contents(span);
-    let inner = match text.len() >= 2 && text.starts_with('[') && text.ends_with(']') {
-        true => Span::new(span.start + 1, span.end - 1),
-        false => span,
-    };
+    let start = span.start + usize::from(text.starts_with('['));
+    let end = (span.end - usize::from(text.ends_with(']'))).max(start);
+    let inner = Span::new(start, end);
     let lexed = lex(working_set.get_span_contents(inner), inner.start, LexOptions::IO_TYPES).map_err(cut)?;
-    let items: Vec<Token> = lexed.into_iter().filter(|token| token.contents == TokenContents::Item).collect();
+    // Like nu, every token counts by position, so a `;` or `|` is read as a
+    // type or an arrow and refused (`[int ; -> int]`).
+    let items: Vec<Token> = lexed
+        .into_iter()
+        .filter(|token| !matches!(token.contents, TokenContents::Eof | TokenContents::Eol | TokenContents::Comment))
+        .map(|token| Token { contents: TokenContents::Item, span: token.span })
+        .collect();
     repeat_to_end(input_output_type).parse_next(&mut Tokens::new(working_set, &items, inner.end))
 }
 
@@ -427,16 +434,16 @@ pub fn parse_var_with_opt_type<'a>(
     token: &Token,
 ) -> ParseResult<(Spanned<&'a str>, bool)> {
     let text = working_set.get_span_contents(token.span);
-    let start = token.span.start + usize::from(text.starts_with('$'));
-    let text = text.strip_prefix('$').unwrap_or(text);
-    let (name, typed) = match text.strip_suffix(':') {
-        Some(name) => (name, true),
+    let (text, typed) = match text.strip_suffix(':') {
+        Some(text) => (text, true),
         None => (text, false),
     };
-    if name.contains([' ', '"', '\'', '`']) || !is_identifier(name) {
+    if text.contains([' ', '"', '\'', '`']) || !is_variable(text) {
         return Err(cut(Diagnostic::expected("valid variable name", token.span)
             .with_help("variable names may not contain spaces, quotes or `.[({+-*^%/=!<>&|`")));
     }
+    let (offset, name) = declared_variable_name(text);
+    let start = token.span.start + offset;
     let span = Span::new(start, start + name.len());
     ensure_not_reserved_variable_name(name, span)?;
     Ok((Spanned::new(name, span), typed))
@@ -457,11 +464,19 @@ pub fn parse_type_after_var<'a>(
         return Err(cut(Diagnostic::new(ErrorKind::ExtraTokens, first.span)));
     }
     match (typed, items.first(), items.last()) {
-        (true, Some(first), Some(last)) => Ok(Some(parse_type(working_set, first.span.merge(last.span))?)),
+        (true, Some(first), Some(last)) => Ok(Some(parse_var_type(working_set, first.span.merge(last.span))?)),
         (true, ..) => Err(cut(Diagnostic::expected("type after `:`", after_name))),
         (false, Some(first), _) => Err(cut(Diagnostic::new(ErrorKind::ExtraTokens, first.span))),
         (false, ..) => Ok(None),
     }
+}
+
+/// The type of a declared variable (`let x: T`, `for x: T in`), which nu
+/// lexes as a signature before it reads the type, so that `record<a: int,
+/// b]>` is an unbalanced delimiter.
+pub fn parse_var_type<'a>(working_set: &WorkingSet<'a>, span: Span) -> ParseResult<TypeAnnotation<'a>> {
+    lex(working_set.get_span_contents(span), span.start, LexOptions::VAR_TYPE).map_err(cut)?;
+    parse_type(working_set, span)
 }
 
 /// Variable names nu reserves (`NameIsBuiltinVar`).

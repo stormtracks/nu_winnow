@@ -12,10 +12,12 @@ Block 0..78
               Arm 28..34
                 Pattern value 28..29
                   Int 2 28..29
-                Call `a` 33..34
+                ExternalCall 33..34
+                  String Bare "a" 33..34
               Arm 36..42
                 Pattern _ 36..37
-                Call `b` 41..42
+                ExternalCall 41..42
+                  String Bare "b" 41..42
       Arm 48..75
         Pattern _ 48..49
         BlockExpr 53..75 54..74
@@ -24,4 +26,5 @@ Block 0..78
               Int 3 61..62
               Arm 65..71
                 Pattern _ 65..66
-                Call `c` 70..71
+                ExternalCall 70..71
+                  String Bare "c" 70..71

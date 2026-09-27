@@ -64,13 +64,47 @@ pub(crate) use working_set::WorkingSet;
 
 /// Configuration for a parse.
 ///
-/// The only knowledge the parser needs beyond the grammar is the set of known
-/// multi-word command names, so that `str trim --left` is parsed as a call to
-/// `str trim` rather than a call to `str` with a `trim` argument. Commands
-/// defined in the file being parsed (`def "my cmd" ...`) are always recognised.
+/// The only knowledge the parser needs beyond the grammar is the set of
+/// commands that exist, as nu-parser has them in its engine state:
+///
+/// * multi-word names, so that `str trim --left` is a call to `str trim`
+///   rather than a call to `str` with a `trim` argument;
+/// * which heads are commands at all: a head that is neither configured nor
+///   defined in the file is an external command, whose arguments are
+///   external strings (`git log 0b2d1f4..HEAD`), as in nu;
+/// * which commands are built-in ([`CommandType::Builtin`]), the only ones
+///   `%name` may call.
+///
+/// Commands defined in the file being parsed (`def "my cmd" ...`) are always
+/// recognised. With no commands configured ([`ParseConfig::empty`]) every head
+/// is one word and a call, and the rules that need to know whether a command
+/// exists are not applied.
 #[derive(Clone, Debug, Default)]
 pub struct ParseConfig {
-    commands: Arc<CommandSet>,
+    commands: Arc<ConfiguredCommands>,
+}
+
+/// The commands of a [`ParseConfig`], behind one `Arc` so that cloning the
+/// configuration for each parse stays cheap.
+#[derive(Clone, Debug, Default)]
+struct ConfiguredCommands {
+    /// Every configured command name.
+    all: CommandSet,
+    /// The names in `all` that are built-in commands.
+    builtins: NameSet,
+}
+
+/// The kind of a configured command (nu-protocol's `CommandType`, for the
+/// kinds a fresh `nu` has at the top level).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommandType {
+    /// A command implemented in Rust (`ls`, `str trim`); `%name` may call it.
+    Builtin,
+    /// A parser keyword (`def`, `if`, `let`).
+    Keyword,
+    /// A command written in Nushell (the standard library's prelude, a
+    /// `use`d module's commands).
+    Custom,
 }
 
 /// Known command names plus an index of the first words of multi-word names,
@@ -132,12 +166,12 @@ impl CommandSet {
 }
 
 impl ParseConfig {
-    /// A configuration that knows Nushell's built-in commands (when the
+    /// A configuration that knows the commands of a fresh `nu` (when the
     /// `builtin-commands` feature is enabled, which it is by default).
     pub fn new() -> Self {
         #[cfg(feature = "builtin-commands")]
         {
-            Self::with_commands(crate::builtin_commands::BUILTIN_COMMANDS.iter().copied())
+            Self::default().add_typed_commands(crate::builtin_commands::BUILTIN_COMMANDS.iter().copied())
         }
         #[cfg(not(feature = "builtin-commands"))]
         {
@@ -150,46 +184,69 @@ impl ParseConfig {
         Self::default()
     }
 
-    /// A configuration knowing exactly the given command names.
+    /// A configuration knowing exactly the given command names, each a
+    /// built-in command.
     pub fn with_commands<I, S>(names: I) -> Self
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        Self::default().add_commands(names)
+        Self::default().add_typed_commands(names.into_iter().map(|name| (name, CommandType::Builtin)))
     }
 
-    /// Add command names (e.g. from `use`d modules) to the known set.
-    pub fn add_commands<I, S>(mut self, names: I) -> Self
+    /// Add custom command names (e.g. from `use`d modules) to the known set.
+    pub fn add_commands<I, S>(self, names: I) -> Self
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        let set = Arc::make_mut(&mut self.commands);
-        for name in names {
-            set.insert(name.as_ref());
+        self.add_typed_commands(names.into_iter().map(|name| (name, CommandType::Custom)))
+    }
+
+    /// Add command names with their kind to the known set.
+    pub fn add_typed_commands<I, S>(mut self, commands: I) -> Self
+    where
+        I: IntoIterator<Item = (S, CommandType)>,
+        S: AsRef<str>,
+    {
+        let configured = Arc::make_mut(&mut self.commands);
+        for (name, command_type) in commands {
+            let name = name.as_ref();
+            configured.all.insert(name);
+            if command_type == CommandType::Builtin {
+                configured.builtins.insert(Box::from(name));
+            }
         }
         self
     }
 
     /// Whether `name` (with words separated by single spaces) is a known command.
+    #[inline]
     pub fn is_known(&self, name: &str) -> bool {
-        self.commands.names.contains(name)
+        self.commands.all.names.contains(name)
+    }
+
+    /// Whether `name` is a known built-in command, which `%name` may call.
+    #[inline]
+    pub fn is_builtin(&self, name: &str) -> bool {
+        self.commands.builtins.contains(name)
     }
 
     /// Whether `word` is the first word of some known multi-word command.
+    #[inline]
     pub fn is_prefix(&self, word: &str) -> bool {
-        self.commands.prefixes.contains(word)
+        self.commands.all.prefixes.contains(word)
     }
 
     /// Number of known command names.
     pub fn len(&self) -> usize {
-        self.commands.names.len()
+        self.commands.all.names.len()
     }
 
     /// `true` if no commands are known.
+    #[inline]
     pub fn is_empty(&self) -> bool {
-        self.commands.names.is_empty()
+        self.commands.all.names.is_empty()
     }
 }
 

@@ -11,4 +11,5 @@ Block 0..22
         Pipeline 16..21
           Subexpression 16..21 17..20
             Pipeline 17..20
-              Call `git` 17..20
+              ExternalCall 17..20
+                String Bare "git" 17..20

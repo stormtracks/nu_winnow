@@ -22,8 +22,8 @@ engine and as the foundation of a formatter such as
   argument counts). `grammar/grammar.md` is a BNF of the language as
   `nu-parser` accepts it, derived from nu-parser's source rule by rule and
   annotated with where this crate implements each rule; every syntactic
-  disagreement it found has been closed and pinned as a fixture, so the two
-  parsers accept and reject the same text (section 9 of that file lists what
+  disagreement it found but one has been closed and pinned as a fixture
+  (section 9 of that file counts them, describes the open one, and lists what
   remains for a consumer with signatures, declarations or files).
 * **Fast.** Roughly 30–45 MB/s per file and 40 MB/s over a 7 MB corpus of
   real scripts in release mode (single-threaded, including file I/O), with
@@ -76,7 +76,7 @@ flags and examples in [`src/docs/how-to.md`](src/docs/how-to.md).
 | `parse(&str) -> Result<Ast, ParseError>` | Parse with the default configuration. |
 | `parse_with(&str, &ParseConfig)` | Parse with an explicit configuration. |
 | `parse_lenient(&str, &ParseConfig) -> (Ast, Vec<Diagnostic>)` | Parse with statement-level recovery. |
-| `ParseConfig` | The set of known (multi-word) command names. |
+| `ParseConfig` | The commands that exist (names and `CommandType`), as nu-parser's engine state has them. |
 | `ast::*` | The tree. Every node has a `Span`. |
 | `ast::Visitor` | A visitor with `walk_*` defaults for building tools. |
 | `flatten::flatten(&Ast)` | Source-ordered `(Span, FlatShape)` pairs, like `nu-parser`'s `flatten_block`. |
@@ -86,13 +86,16 @@ flags and examples in [`src/docs/how-to.md`](src/docs/how-to.md).
 
 ### Configuration
 
-Nushell resolves multi-word command names (`str trim`, `into int`) by looking
-them up in the engine's declarations. This crate ships the list of built-in
-command names (feature `builtin-commands`, on by default) and always registers
-commands defined in the file being parsed, so `str trim --left` is a call to
-`str trim`. Use `ParseConfig::with_commands` or `add_commands` to supply the
-names exported by modules you `use`, or `ParseConfig::empty()` to treat every
-head as a single word.
+Nushell resolves command names by looking them up in the engine's
+declarations: multi-word names (`str trim --left` is a call to `str trim`),
+and whether a head is a command at all (`git log 0b2d1f4..HEAD` is an external
+call, whose arguments are strings). This crate ships the commands of a fresh
+`nu` (feature `builtin-commands`, on by default; `src/builtin_commands.rs`,
+generated from `tools/nushell-harness` by `tools/scripts/gen-builtin-commands.nu`)
+and always registers commands defined in the file being parsed. Use
+`ParseConfig::add_commands` to supply the commands exported by modules you
+`use`, `with_commands` for a table of your own, or `ParseConfig::empty()` to
+treat every head as a one-word call.
 
 ## The AST
 
@@ -120,10 +123,12 @@ directly, while keeping everything a formatter needs:
 Things that require a command's signature are deliberately *not* decided by
 the parser, exactly as in `nu-parser` before signature lookup: whether a flag
 takes the following argument as its value (`--flag value` is a `Flag` followed
-by a `Positional`; `--flag=value` carries its value), and whether an unknown
-head is an internal or external command (all bare heads become `Call`; `^cmd`
-becomes `ExternalCall`; `%cmd` is a `Call` with a `sigil` and `%$cmd` a
-`DynamicCall`). An evaluator applies its signatures on top. The commands that
+by a `Positional`; `--flag=value` carries its value), and the shape of each
+positional of an ordinary command. Whether a head is a command is decided as
+in nu: a known head is a `Call`, and a head the configuration does not know
+(`git log`), or an alias of an external command, is an `ExternalCall` with
+external arguments, as is `^cmd`; `%cmd` is a `Call` with a `sigil` and `%$cmd`
+a `DynamicCall`. An evaluator applies its signatures on top. The commands that
 are keywords for nu-parser (`hide`, `source`, `source-env`, `run`, `overlay *`,
 `plugin use`, the built-in attributes) have fixed signatures, so their flags,
 positional counts and `--help`/`--` boundaries are checked here as nu does.
@@ -212,16 +217,24 @@ Nushell scripts in `tools/scripts/`):
   argument counts). No file that nu accepts is rejected here. The
   differential harness parses the fixtures, the corpora, nu-std, nushell's
   own `.nu` tests, `nu_scripts`, every command example and the book with both
-  parsers, then mutates each input three times; no syntactic disagreement
-  remains (the rows it still prints are `plugin use` calls, because the
-  harness registers no plugin commands, and errors that need files or
-  signatures).
+  parsers, then mutates each input three times. Its nu-parser runs in the `nu`
+  binary's engine (the same commands and features), and it keeps no list of
+  tolerated differences. Over the originals nothing disagrees except errors
+  that need files, modules, types or signatures, and the same holds for the
+  mutants of seed 1. Other seeds find a few rows that nu-parser reports as
+  syntax errors although deciding them needs more than the text (a module's
+  contents in `use m f f`, a signature in `skip 0x[01 23 45 67]`, a
+  variable's existence in `..$$ a`; `grammar/grammar.md` section 9.4), and
+  one open syntactic row, `alias i = if if x y` (section 9.2).
 * **Token classification.** For every standard-library file,
   `tools/scripts/flatcmp.nu` compares the output of nu's `ast --flatten` with
   this crate's `flatten()` segment by segment. The only differences are the
-  documented signature-dependent ones (`get content.0` is a cell path only
-  because `get` declares that shape), attribute lines (which nu's flatten
-  treats as opaque) and `$.` (a cell-path literal here, a delimiter for nu).
+  documented ones: signature-dependent shapes (`get content.0` is a cell path
+  only because `get` declares that shape), attribute lines (which nu's
+  flatten treats as opaque), `$.` (a cell-path literal here, a delimiter for
+  nu), and the `=>` of a last match arm whose body is an empty `{ }` inside a
+  `def` (nu's flatten emits nothing for the empty block, so the gap takes the
+  enclosing closure's shape).
 * **Speed.** `tools/nushell-harness/bench-vs-nu-parser` times both parsers on the
   same bytes, with `nu-parser` given the full command set as in the shell.
   Two Nushell releases are shown, since 0.115.2 sped up `nu-parser`

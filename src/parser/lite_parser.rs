@@ -107,15 +107,16 @@ fn record_comments(working_set: &WorkingSet<'_>, comment_tokens: &[Token], comme
 pub enum AfterPipe {
     /// A command follows.
     Command,
-    /// A blank line or the end of the block: the pipeline ends here and the
-    /// `|` is dropped.
+    /// A blank line, a `;` (after a redirection pipe such as `e>|`; the lexer
+    /// refuses one after a plain `|`) or the end of the block: the pipeline ends
+    /// here and the `|` is dropped.
     Dangling,
 }
 
 /// After a `|`: the comments on its line, then one end of line and any
 /// comment lines (`Comment* [Eol (Comment Eol)*]`), the way nu's lite parser
 /// keeps a pipeline open across them.
-pub fn after_pipe(tokens: &mut Tokens<'_, '_>, pipe: Span, comments: &mut Vec<Comment>) -> ParseResult<AfterPipe> {
+pub fn after_pipe(tokens: &mut Tokens<'_, '_>, comments: &mut Vec<Comment>) -> ParseResult<AfterPipe> {
     let same_line: Vec<Token> = repeat(0.., comment).parse_next(tokens)?;
     let later_lines: Option<Vec<Token>> =
         opt(preceded(eol, repeat(0.., terminated(comment, eol)))).parse_next(tokens)?;
@@ -124,10 +125,7 @@ pub fn after_pipe(tokens: &mut Tokens<'_, '_>, pipe: Span, comments: &mut Vec<Co
     // A `|` that only comments follow at the end of the block is reported
     // once, by `parse_block`, whichever command absorbed it.
     match tokens.peek_token().map(|token| token.contents) {
-        None | Some(TokenContents::Eol) => Ok(AfterPipe::Dangling),
-        Some(TokenContents::Semicolon) => {
-            Err(cut(Diagnostic::new(ErrorKind::UnexpectedEof("command after `|`"), pipe).with_context("pipeline")))
-        }
+        None | Some(TokenContents::Eol | TokenContents::Semicolon) => Ok(AfterPipe::Dangling),
         Some(_) => Ok(AfterPipe::Command),
     }
 }
@@ -154,7 +152,11 @@ pub fn parse_lite_command(tokens: &mut Tokens<'_, '_>, first: bool) -> ParseResu
             }
             TokenContents::Eol if absorbing => {
                 // `$x = a |\n b` and `$x = a\n | b` continue the assignment's pipeline.
-                let ends_with_pipe = lite_command.parts.last().is_some_and(|part| part.contents == TokenContents::Pipe);
+                // Like nu (`last_non_comment_token`), comment lines may come after the
+                // `|`, but a blank line ends the command: `let x = 1 |\n\nls` leaves
+                // `1 |` without an end.
+                let ends_with_pipe =
+                    last_non_comment_token(&tokens.all()[..tokens.position()]) == Some(TokenContents::Pipe);
                 if ends_with_pipe {
                     tokens.next_token();
                     continue;
@@ -211,6 +213,7 @@ fn lite_attribute_lines(tokens: &mut Tokens<'_, '_>, lite_command: &mut LiteComm
         token.contents == TokenContents::Item && working_set.get_span_contents(token.span).starts_with('@')
     }) {
         let mut attribute_line = Vec::new();
+        let mut ends_with_pipe = false;
         while let Some(&token) = tokens.peek_token() {
             match token.contents {
                 TokenContents::Comment => {
@@ -218,15 +221,31 @@ fn lite_attribute_lines(tokens: &mut Tokens<'_, '_>, lite_command: &mut LiteComm
                     lite_command.comments.push(Comment { span: token.span });
                 }
                 TokenContents::Eol | TokenContents::Semicolon => {
+                    ends_with_pipe &= token.contents == TokenContents::Eol;
                     tokens.next_token();
                     break;
                 }
                 TokenContents::Eof => break,
-                _ => attribute_line.push(Token { contents: TokenContents::Item, span: token.span }),
+                _ => {
+                    ends_with_pipe = token.contents == TokenContents::Pipe;
+                    attribute_line.push(Token { contents: TokenContents::Item, span: token.span });
+                }
             }
             tokens.next_token();
         }
         lite_command.attributes.push(attribute_line);
+        // A line ending with `|` keeps nu's command open across comment lines
+        // (`last_non_comment_token`), so the definition may follow them.
+        while ends_with_pipe
+            && let [comment, eol, ..] = tokens.remaining()
+            && comment.contents == TokenContents::Comment
+            && eol.contents == TokenContents::Eol
+        {
+            working_set.add_comment(comment.span);
+            lite_command.comments.push(Comment { span: comment.span });
+            tokens.next_token();
+            tokens.next_token();
+        }
         if let Some(token) = tokens.peek_token()
             && matches!(token.contents, TokenContents::Eol | TokenContents::Comment)
         {

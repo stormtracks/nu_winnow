@@ -185,6 +185,14 @@ impl Flattener<'_> {
         self.visit_block(block);
         self.push(Span::new(block.span.end, expr_span.end), shape);
     }
+
+    /// A keyword's block, or the variable or subexpression standing in for it.
+    fn block_or_value(&mut self, expr_span: Span, block: &Block<'_>, value: Option<&Expression<'_>>) {
+        match value {
+            Some(value) => self.visit_expression(value),
+            None => self.block_braces(expr_span, block, FlatShape::Block),
+        }
+    }
 }
 
 impl<'a> Visitor<'a> for Flattener<'_> {
@@ -402,7 +410,9 @@ impl<'a> Visitor<'a> for Flattener<'_> {
                 self.args(&dynamic_call.arguments);
             }
             Expr::ExternalCall(external_call) => {
-                self.push(external_call.caret, FlatShape::External);
+                if let Some(caret) = external_call.caret {
+                    self.push(caret, FlatShape::External);
+                }
                 match &external_call.head.expr {
                     Expr::String(_) => self.push(external_call.head.span, FlatShape::External),
                     _ => self.visit_expression(&external_call.head),
@@ -507,10 +517,10 @@ impl<'a> Visitor<'a> for Flattener<'_> {
             Expr::If(if_expression) => {
                 self.visit_expression(&if_expression.condition);
                 let then_end = if_expression.else_branch.as_ref().map_or(span.end, |e| e.keyword.start);
-                self.block_braces(
+                self.block_or_value(
                     Span::new(if_expression.condition.span.end, then_end),
                     &if_expression.then_block,
-                    FlatShape::Block,
+                    if_expression.then_value.as_deref(),
                 );
                 if let Some(else_branch) = &if_expression.else_branch {
                     self.push(else_branch.keyword, FlatShape::Keyword);
@@ -544,18 +554,26 @@ impl<'a> Visitor<'a> for Flattener<'_> {
                 }
                 self.push(for_loop.in_keyword, FlatShape::Keyword);
                 self.visit_expression(&for_loop.iterable);
-                self.block_braces(Span::new(for_loop.iterable.span.end, span.end), &for_loop.body, FlatShape::Block);
+                self.block_or_value(
+                    Span::new(for_loop.iterable.span.end, span.end),
+                    &for_loop.body,
+                    for_loop.body_value.as_deref(),
+                );
             }
             Expr::While(while_loop) => {
                 self.visit_expression(&while_loop.condition);
-                self.block_braces(
+                self.block_or_value(
                     Span::new(while_loop.condition.span.end, span.end),
                     &while_loop.body,
-                    FlatShape::Block,
+                    while_loop.body_value.as_deref(),
                 );
             }
             Expr::Loop(loop_expression) => {
-                self.block_braces(Span::new(keyword.end, span.end), &loop_expression.body, FlatShape::Block);
+                self.block_or_value(
+                    Span::new(keyword.end, span.end),
+                    &loop_expression.body,
+                    loop_expression.body_value.as_deref(),
+                );
             }
             Expr::Break | Expr::Continue => {}
             Expr::Return(return_expression) => {
@@ -565,7 +583,11 @@ impl<'a> Visitor<'a> for Flattener<'_> {
             }
             Expr::Try(try_expression) => {
                 let body_end = try_expression.handlers.first().map_or(span.end, |h| h.keyword.start);
-                self.block_braces(Span::new(keyword.end, body_end), &try_expression.body, FlatShape::Block);
+                self.block_or_value(
+                    Span::new(keyword.end, body_end),
+                    &try_expression.body,
+                    try_expression.body_value.as_deref(),
+                );
                 for handler in &try_expression.handlers {
                     self.push(handler.keyword, FlatShape::Keyword);
                     self.visit_expression(&handler.body);

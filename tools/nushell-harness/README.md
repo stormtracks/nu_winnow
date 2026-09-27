@@ -11,6 +11,17 @@ checkout next to this repository) to answer three questions:
    `TESTING.md` at the repository root)?
 3. How would the new parser plug into the Nushell engine?
 
+Every binary uses one engine state, `nushell_harness::engine` in `src/lib.rs`:
+the commands the `nu` binary registers (nushell's `src/command_context.rs`,
+in the same order, with the `plugin`, `sqlite` and `trash-support` features),
+the `$nu` constant and the standard library with its prelude, and no plugins,
+as in `nu -n`. `nu-cli` needs reedline's `main` branch, which `Cargo.toml`
+patches in as nushell's own workspace does. `builtin-commands` prints that
+engine's commands with their `CommandType`, and
+`tools/scripts/gen-builtin-commands.nu` turns them into
+`src/builtin_commands.rs`, so this parser and the harness's nu-parser know
+the same commands.
+
 ## `bench-vs-nu-parser`
 
 ```text

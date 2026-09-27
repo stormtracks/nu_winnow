@@ -47,6 +47,7 @@ use nu_protocol::{
 };
 use nu_winnow_parser::ast as w;
 use nu_winnow_parser::lex::AssignmentOperator;
+use nushell_harness::engine;
 
 type LResult<T> = Result<T, String>;
 
@@ -140,6 +141,17 @@ impl<'ws, 'e, 'a> Lower<'ws, 'e, 'a> {
     }
 
     /// A scoped block (bodies of `if`, `for`, closures, ...), lowered and added to the working set.
+    /// A keyword's block argument, or the variable or subexpression standing
+    /// in for it (`if $c $env.f`), which nu type-checks as a block.
+    fn block_arg(&mut self, block: &w::Block<'a>, value: Option<&w::Expression<'a>>) -> LResult<Expression> {
+        if let Some(value) = value {
+            return self.expr(value);
+        }
+        let block_span = self.span(block.span);
+        let id = self.scoped_block(block, block_span, false)?;
+        Ok(self.expression(Expr::Block(id), block_span, Type::Block))
+    }
+
     fn scoped_block(&mut self, block: &w::Block<'a>, span: Span, to_ir: bool) -> LResult<BlockId> {
         self.ws.enter_scope();
         let mut out = Block::new();
@@ -396,17 +408,13 @@ impl<'ws, 'e, 'a> Lower<'ws, 'e, 'a> {
                 let mut call = self.keyword_call("while", self.keyword_span(span, "while"))?;
                 let cond = self.expr(&wh.condition)?;
                 call.add_positional(cond);
-                let body_span = self.span(wh.body.span);
-                let body = self.scoped_block(&wh.body, body_span, false)?;
-                let body = self.expression(Expr::Block(body), body_span, Type::Block);
+                let body = self.block_arg(&wh.body, wh.body_value.as_deref())?;
                 call.add_positional(body);
                 (Expr::Call(Box::new(call)), Type::Nothing)
             }
             w::Expr::Loop(l) => {
                 let mut call = self.keyword_call("loop", self.keyword_span(span, "loop"))?;
-                let body_span = self.span(l.body.span);
-                let body = self.scoped_block(&l.body, body_span, false)?;
-                let body = self.expression(Expr::Block(body), body_span, Type::Block);
+                let body = self.block_arg(&l.body, l.body_value.as_deref())?;
                 call.add_positional(body);
                 (Expr::Call(Box::new(call)), Type::Nothing)
             }
@@ -422,9 +430,7 @@ impl<'ws, 'e, 'a> Lower<'ws, 'e, 'a> {
             }
             w::Expr::Try(t) => {
                 let mut call = self.keyword_call("try", self.keyword_span(span, "try"))?;
-                let body_span = self.span(t.body.span);
-                let body = self.scoped_block(&t.body, body_span, false)?;
-                let body = self.expression(Expr::Block(body), body_span, Type::Block);
+                let body = self.block_arg(&t.body, t.body_value.as_deref())?;
                 call.add_positional(body);
                 for h in &t.handlers {
                     let kw = match h.kind {
@@ -531,7 +537,8 @@ impl<'ws, 'e, 'a> Lower<'ws, 'e, 'a> {
     }
 
     /// A call to an internal command, with arguments assigned by its signature.
-    /// Unknown commands become external calls, as in Nushell.
+    /// The parser already makes a head it does not know an `ExternalCall`; a
+    /// name it knows but this engine does not still becomes one, as in Nushell.
     fn call(&mut self, c: &w::Call<'a>, span: Span) -> LResult<Expression> {
         let head_span = self.span(c.head.span);
         let Some(decl_id) = self.ws.find_decl(c.head.name.as_bytes()) else {
@@ -759,9 +766,7 @@ impl<'ws, 'e, 'a> Lower<'ws, 'e, 'a> {
         let mut call = self.keyword_call("if", self.keyword_span(span, "if"))?;
         let cond = self.expr(&i.condition)?;
         call.add_positional(cond);
-        let then_span = self.span(i.then_block.span);
-        let then_id = self.scoped_block(&i.then_block, then_span, false)?;
-        let then = self.expression(Expr::Block(then_id), then_span, Type::Block);
+        let then = self.block_arg(&i.then_block, i.then_value.as_deref())?;
         call.add_positional(then);
         if let Some(e) = &i.else_branch {
             let body = self.expr(&e.body)?;
@@ -786,11 +791,9 @@ impl<'ws, 'e, 'a> Lower<'ws, 'e, 'a> {
         let keyword = Keyword { keyword: b"in".as_slice().into(), span: in_span, expr: iterable };
         let kw = self.expression(Expr::Keyword(Box::new(keyword)), full, Type::Any);
         call.add_positional(kw);
-        let body_span = self.span(f.body.span);
-        let body = self.scoped_block(&f.body, body_span, false);
+        let body = self.block_arg(&f.body, f.body_value.as_deref());
         self.ws.exit_scope();
-        let body = self.expression(Expr::Block(body?), body_span, Type::Block);
-        call.add_positional(body);
+        call.add_positional(body?);
         Ok(self.expression(Expr::Call(Box::new(call)), span, Type::Nothing))
     }
 
@@ -934,13 +937,6 @@ fn assign_op(op: AssignmentOperator) -> Assignment {
 
 // --- driving the engine -------------------------------------------------------------------
 
-fn engine() -> EngineState {
-    let engine_state = nu_cmd_lang::create_default_context();
-    let mut engine_state = nu_command::add_shell_command_context(engine_state);
-    let _ = nu_std::load_standard_library(&mut engine_state);
-    engine_state
-}
-
 fn new_stack() -> Stack {
     let mut stack = Stack::new();
     for (k, v) in std::env::vars() {
@@ -1025,7 +1021,7 @@ fn main() {
             other => script = Some(other.to_string()),
         }
     }
-    let mut engine_state = engine();
+    let mut engine_state = engine(true);
     if demo {
         let mut agree = 0;
         for src in DEMO {

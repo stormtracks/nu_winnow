@@ -21,7 +21,7 @@ external tools. `verify.nu` needs the checkouts listed below.
 | --- | --- | --- |
 | `nu` 0.115 on `PATH` | | every script in `tools/scripts/` |
 | Nushell source checkout | `~/src/nushell` (also `../nushell` for the traceability test) | `extract-corpus.nu`, traceability, the corpora `verify.nu` reads (`crates/nu-std`, `tests`) |
-| network, for the first harness build | | `tools/nushell-harness` fetches `nu-parser` from nushell's `main` on GitHub; `cargo update` there moves to the newest commit, or uncomment its `[patch]` block to use the checkout next to this repository (needed when GitHub's `main` is behind the checkout: the differential rung then reports the checkout's behaviour) |
+| network, for the first harness build | | `tools/nushell-harness` fetches nushell's crates from `main` on GitHub (and reedline's `main`, which `nu-cli` needs, as nushell itself does); `cargo update` there moves to the newest commit, or uncomment its `[patch]` block to use the checkout next to this repository (needed when GitHub's `main` is behind the checkout: the differential rung then reports the checkout's behaviour) |
 | `ebnf2railroad` (npm), optional | | linting `grammar/grammar.ebnf` and rendering `grammar/grammar.html` (README, "Grammar Railroad Diagram") |
 | nushell.github.io checkout | `~/src/nushell.github.io` | `extract-corpus.nu` (the book's code blocks) |
 | nu_scripts checkout | `~/src/nu_scripts` | `verify.nu`, `nucheck-compare.nu`, `differential` |
@@ -75,12 +75,13 @@ nu tools/scripts/verify.nu --save tools/scripts/verify-history.nuon
 | Rung | Command run on its own | Good means |
 | --- | --- | --- |
 | cargo test | `cargo test --all-features` | 0 failures |
+| command table | `nu tools/scripts/gen-builtin-commands.nu --check` | `src/builtin_commands.rs` lists exactly the commands of the harness's engine |
 | fixtures-compare | `nu tools/scripts/fixtures-compare.nu` | 0 rows where `ours != expected`; rows where only `nu-check` disagrees are semantic (missing files, plugins) and listed with nu-parser's message |
 | differential, originals | `cd tools/nushell-harness; cargo run --release --bin differential -- ../../tests/fixtures ../../tests/corpus ~/src/nushell/crates/nu-std ~/src/nushell/tests ~/src/nu_scripts --snippets ../../tests/corpus/snippets/nu-command-examples.json --snippets ../../tests/corpus/snippets/book.json` | 0 `ours_rejects`, 0 `nu_syntax_rejects`, 0 `panics` |
-| differential, mutants | the same with `--mutants 3 --seed 1` | as few as possible; 0 panics |
+| differential, mutants | the same with `--mutants 3 --seed 1` | 0 `ours_rejects`, 0 `nu_syntax_rejects`, 0 `panics` (other seeds find rows of the classes in `grammar/grammar.md` 9.4; see below) |
 | nucheck-compare | `nu tools/scripts/nucheck-compare.nu ~/src/nu_scripts ~/src/nushell/crates/nu-std` | 0 files nu accepts that we reject |
-| flatcmp | `nu -c 'nu tools/scripts/flatcmp.nu --commands tools/scripts/std_commands.txt ...(glob ~/src/nushell/crates/nu-std/**/*.nu)'` | only the documented signature-dependent differences |
-| nufmt-fixtures | `nu tools/scripts/nufmt-fixtures.nu` | 111 of 130 reference fixtures |
+| flatcmp | `nu -c 'nu tools/scripts/flatcmp.nu --commands tools/scripts/std_commands.txt ...(glob ~/src/nushell/crates/nu-std/**/*.nu)'` | only the documented differences (`src/docs/how-to.md`, `flatcmp.nu`) |
+| nufmt-fixtures | `nu tools/scripts/nufmt-fixtures.nu` | 114 of 130 reference fixtures |
 
 The scoreboard's `ok` column is the gate. `--save` appends the table with
 the date and the Nushell commit to a NUON file, so a number that moves can be
@@ -95,16 +96,20 @@ traced to a parser change or to a Nushell change.
 * `fixtures-compare --details` returns a table with `ours`, `nu`, `main` and
   `main_error`; `where ours != nu` shows the rows to look at.
 * `differential --details` prints every disagreement with both parsers'
-  messages and the text. nu-parser's error is classified as syntax or
-  semantic by its variant and message (`is_syntax_error` in
-  `tools/nushell-harness/src/bin/differential.rs`); a `known` row is one of
-  the documented tolerances in `KNOWN_DIFFERENCES` there. The harness builds
-  an engine state without plugin commands, so every `plugin use` snippet is
-  an external call for it and shows up as `ours_rejects`; those rows are
-  artifacts (the `nu` on `PATH`, through `fixtures-compare`, is the
-  referee for them). The other rows it prints need a file, a module or a
-  signature (`use eggs foo foo`, `bytes at 0x[01]`), which are the
-  consumer's checks listed in `grammar/grammar.md` section 9.4.
+  messages and the text, semantic ones included; nothing is tolerated
+  silently. nu-parser's error is classified as syntax or semantic by its
+  variant and message (`is_syntax_error` in
+  `tools/nushell-harness/src/bin/differential.rs`). The harness engine is
+  the `nu` binary's (`src/lib.rs` mirrors nushell's `command_context.rs`,
+  with the same default features), and `src/builtin_commands.rs` is
+  generated from it, so both parsers know the same commands. With seed 1
+  the mutants have no row outside the semantic ones; other seeds (run
+  `--seed 2` to `--seed 10`) find a few, each of a class that needs more
+  than the text and is listed in `grammar/grammar.md` section 9.4: a
+  module's contents (`use m f f`), a built-in command's signature
+  (`skip 0x[01 23 45 67]`, `glob "**/*.txt": --follow-symlinks`), a
+  variable's existence (`..$$ a`) or a file (`use` of a binary). One
+  syntactic row is open, `alias i = if if x y` (section 9.2).
 * For one snippet, `open --raw file.nu | nu-check` is the quickest referee;
   keep the snippet in a file made with `printf '%s\n'` so that shell
   escapes survive, and check it with `cat -v` when it contains `\r` or `\t`.
@@ -133,7 +138,8 @@ traced to a parser change or to a Nushell change.
 ## When the Nushell checkout moves
 
 ```nushell
-cd tools/nushell-harness; cargo build --release --bin differential --bin nu-parser-check; cd ../..
+cd tools/nushell-harness; cargo build --release --bin differential --bin nu-parser-check --bin builtin-commands; cd ../..
+nu tools/scripts/gen-builtin-commands.nu # the commands the parser knows, from the new engine
 nu tools/scripts/extract-corpus.nu       # new command examples and book blocks
 cargo test --test traceability           # new SyntaxShape / keyword / ParseError variants show up here
 nu tools/scripts/verify.nu --save tools/scripts/verify-history.nuon

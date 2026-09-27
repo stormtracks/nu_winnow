@@ -20,7 +20,7 @@ use crate::span::{Span, Spanned};
 use super::WorkingSet;
 use super::lite_parser::lite_parse_parts;
 use super::parse_expressions::{ExpectedShape, parse_value};
-use super::parse_helpers::{delimited_interior, is_identifier};
+use super::parse_helpers::{declared_variable_name, delimited_interior, is_variable};
 use super::parse_signatures::ensure_not_reserved_variable_name;
 use super::tokens::{Tokens, cut_with, expected, item, keyword};
 
@@ -46,10 +46,11 @@ pub fn pattern<'a>(tokens: &mut Tokens<'_, 'a>) -> ParseResult<MatchPattern<'a>>
 /// The name of a `$var` pattern, which binds a variable and so may not be a
 /// reserved name.
 fn parse_variable_pattern<'a>(working_set: &WorkingSet<'a>, span: Span) -> ParseResult<&'a str> {
-    let name = working_set.get_span_contents(span).strip_prefix('$').unwrap_or_default();
-    if !is_identifier(name) {
+    let text = working_set.get_span_contents(span);
+    if !is_variable(text) {
         return Err(cut(Diagnostic::expected("valid variable name", span)));
     }
+    let (_, name) = declared_variable_name(text);
     ensure_not_reserved_variable_name(name, span)?;
     Ok(name)
 }

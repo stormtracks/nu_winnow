@@ -220,6 +220,16 @@ impl LexOptions {
     /// Options for signatures `[a: int, --flag(-f)]`.
     pub const SIGNATURE: LexOptions =
         LexOptions { additional_whitespace: b"\n\r", special_tokens: b":=,", skip_comments: false, in_signature: true };
+    /// Options for type parameters `list<int>`, `oneof<a, b>`, `record<a: int>`
+    /// (nu's `lex_signature` in `parse_type_params`): `:` and `,` are special
+    /// and comments are skipped.
+    pub const TYPE_PARAMS: LexOptions =
+        LexOptions { additional_whitespace: b"\n\r", special_tokens: b":,", skip_comments: true, in_signature: true };
+    /// Options for the type of a declared variable `let x: record<a: int>`
+    /// (nu's `lex_signature` in `parse_var_with_opt_type`): `<`/`>` pair up,
+    /// so a stray `]` or `}` inside them is unbalanced.
+    pub const VAR_TYPE: LexOptions =
+        LexOptions { additional_whitespace: b"", special_tokens: b",", skip_comments: true, in_signature: true };
     /// Options for input/output type lists `[int -> string, nothing -> nothing]`.
     pub const IO_TYPES: LexOptions =
         LexOptions { additional_whitespace: b"\n\r,", special_tokens: &[], skip_comments: true, in_signature: true };
@@ -251,6 +261,13 @@ pub fn lex(text: &str, base: usize, options: LexOptions) -> Result<Vec<Token>, D
     lex_n_tokens(text, base, options, usize::MAX)
 }
 
+/// nu's `ExtraTokens` for a `;` right after a `|`.
+#[cold]
+#[inline(never)]
+fn semicolon_after_pipe(span: Span) -> Diagnostic {
+    Diagnostic::new(ErrorKind::ExtraTokens, span).with_help("a `|` must be followed by a command before the `;`")
+}
+
 /// Like [`lex`], but stop after `max_tokens` tokens, not counting `Eof`
 /// (nu's `lex_n_tokens`).
 ///
@@ -260,9 +277,24 @@ pub fn lex_n_tokens(text: &str, base: usize, options: LexOptions, max_tokens: us
     let mut input = input(text, base);
     let capacity = (text.len() / 6).max(4).min(max_tokens.saturating_add(1));
     let mut tokens: Vec<Token> = Vec::with_capacity(capacity);
+    // nu's `is_complete`: a `;` after a `|` with no item between them is
+    // "extra tokens" (`ls |; ls`, and `{|x|; 1}`, whose parameter list ends
+    // with a plain `|`). Newlines, comments and `||` leave it as it is.
+    let mut after_pipe = false;
     while tokens.len() < max_tokens {
         match next_token(&mut input, options) {
-            Ok(Some(token)) => tokens.push(token),
+            Ok(Some(token)) => {
+                match token.contents {
+                    TokenContents::Pipe => after_pipe = true,
+                    TokenContents::Semicolon if after_pipe => return Err(semicolon_after_pipe(token.span)),
+                    TokenContents::Eol
+                    | TokenContents::Comment
+                    | TokenContents::PipePipe
+                    | TokenContents::Semicolon => {}
+                    _ => after_pipe = false,
+                }
+                tokens.push(token);
+            }
             Ok(None) => break,
             Err(error) => return Err(into_diagnostic(error)),
         }
@@ -599,16 +631,32 @@ fn lex_raw_string(bytes: &[u8], start: usize, absolute: impl Fn(usize) -> usize)
     )))
 }
 
+/// The assignment operator `text` spells, if any (nu's `is_assignment_operator`).
+pub(crate) fn assignment_operator(text: &str) -> Option<AssignmentOperator> {
+    assignment_operator_bytes(text.as_bytes())
+}
+
+/// The assignment operator of [`item_contents`], if `text` is one.
+#[inline(always)]
+fn assignment_operator_bytes(text: &[u8]) -> Option<AssignmentOperator> {
+    Some(match text {
+        b"=" => AssignmentOperator::Assign,
+        b"+=" => AssignmentOperator::AddAssign,
+        b"-=" => AssignmentOperator::SubtractAssign,
+        b"*=" => AssignmentOperator::MultiplyAssign,
+        b"/=" => AssignmentOperator::DivideAssign,
+        b"++=" => AssignmentOperator::ConcatenateAssign,
+        _ => return None,
+    })
+}
+
 /// What a lexed item is: an assignment operator, a redirection, or a plain
 /// item (nu's `lex_item` does this at its end). Bash-isms are refused.
 fn item_contents(text: &[u8]) -> Result<TokenContents, (ErrorKind, Option<&'static str>)> {
+    if let Some(operator) = assignment_operator_bytes(text) {
+        return Ok(TokenContents::AssignmentOperator(operator));
+    }
     Ok(match text {
-        b"=" => TokenContents::AssignmentOperator(AssignmentOperator::Assign),
-        b"+=" => TokenContents::AssignmentOperator(AssignmentOperator::AddAssign),
-        b"-=" => TokenContents::AssignmentOperator(AssignmentOperator::SubtractAssign),
-        b"*=" => TokenContents::AssignmentOperator(AssignmentOperator::MultiplyAssign),
-        b"/=" => TokenContents::AssignmentOperator(AssignmentOperator::DivideAssign),
-        b"++=" => TokenContents::AssignmentOperator(AssignmentOperator::ConcatenateAssign),
         b"out>" | b"o>" => TokenContents::Redirection(RedirectionOperator::Out),
         b"out>>" | b"o>>" => TokenContents::Redirection(RedirectionOperator::OutAppend),
         b"err>" | b"e>" => TokenContents::Redirection(RedirectionOperator::Err),

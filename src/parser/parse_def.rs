@@ -16,18 +16,19 @@ use super::WorkingSet;
 use super::parse_expressions::{
     BraceShape, ExpectedShape, brace_shape, parse_block_body_unchecked, parse_closure_parts, parse_value,
 };
-use super::parse_helpers::is_help_flag;
-use super::parse_keywords::{KeywordCall, is_parser_keyword, parse_block_argument, seen_end_of_options};
-use super::parse_literals::{parse_filesize, parse_float, parse_int};
-use super::parse_shape_specs::parse_type;
-use super::parse_signatures::{parse_definition_name, parse_full_signature, parse_var_with_opt_type};
+use super::parse_helpers::{is_help_flag, is_spread};
+use super::parse_keywords::{KeywordCall, is_parser_keyword, parse_block_or_value_argument, seen_end_of_options};
+use super::parse_signatures::{parse_definition_name, parse_full_signature, parse_var_type, parse_var_with_opt_type};
 use super::tokens::{Tokens, item, tokens_until};
+use super::working_set::DeclKind;
 
-/// Declare the names of the `def`/`extern`/`alias` statements of a block
-/// before parsing it (nu's `parse_def_predecl`, which nu's `parse_block` calls
-/// for every statement first), so calls to multi-word commands defined later
-/// resolve. Like nu, a `def` or `extern` name declared twice in one block is
-/// an error.
+/// Declare the names of the `def`/`extern` statements of a block before
+/// parsing it (nu's `parse_def_predecl`, which nu's `parse_block` calls for
+/// every statement first), so calls to commands defined later resolve. Like
+/// nu, only a definition with a signature item after its name is
+/// predeclared, and a name declared twice in one block is an error. An
+/// `alias` is declared when its statement is parsed (`WorkingSet::add_alias`),
+/// so a call before it is an unknown command.
 pub fn parse_def_predecl(working_set: &WorkingSet<'_>, tokens: &[Token]) {
     let mut declared: Vec<&str> = Vec::new();
     let mut at_line_start = true;
@@ -39,28 +40,38 @@ pub fn parse_def_predecl(working_set: &WorkingSet<'_>, tokens: &[Token]) {
             TokenContents::Comment => {}
             TokenContents::Item if at_line_start => {
                 at_line_start = false;
-                let mut words = tokens[index..]
-                    .iter()
-                    .take_while(|token| token.contents == TokenContents::Item)
-                    .map(|token| (working_set.get_span_contents(token.span), token.span));
+                let statement = || {
+                    tokens[index..]
+                        .iter()
+                        .take_while(|token| token.contents == TokenContents::Item)
+                        .map(|token| (working_set.get_span_contents(token.span), token.span))
+                };
+                let mut words = statement();
                 let head = match working_set.get_span_contents(token.span) {
                     "export" => words.next().map_or("", |(word, _)| word),
                     head => head,
                 };
-                if !matches!(head, "def" | "extern" | "alias") {
+                if !matches!(head, "def" | "extern") {
                     continue;
                 }
                 let Some((name, name_span)) = words.find(|(word, _)| !word.starts_with('-')) else { continue };
                 let name = name.trim_matches(['"', '\'', '`']);
-                if name.is_empty() {
-                    continue;
-                }
-                working_set.add_predecl(name);
                 // nu predeclares a definition only when a signature item follows the name.
-                let has_signature = head != "alias" && words.any(|(word, _)| word.starts_with(['[', '(']));
-                if !has_signature {
+                if name.is_empty() || !words.any(|(word, _)| word.starts_with(['[', '('])) {
                     continue;
                 }
+                // nu gives the untyped rest parameter of a `def --wrapped` the
+                // `external_arg` shape.
+                let wrapped = head == "def"
+                    && tokens[index..]
+                        .iter()
+                        .take_while(|token| token.contents == TokenContents::Item)
+                        .any(|token| token.span.len() == 9 && working_set.get_span_contents(token.span) == "--wrapped")
+                    && statement()
+                        .skip_while(|(_, span)| *span != name_span)
+                        .find(|(word, _)| word.starts_with(['[', '(']))
+                        .is_some_and(|(signature, _)| has_untyped_rest(signature));
+                working_set.add_predecl(name, if wrapped { DeclKind::Wrapped } else { DeclKind::Declared });
                 if declared.contains(&name) {
                     working_set.error(
                         Diagnostic::message("duplicate command definition within a block", name_span)
@@ -74,9 +85,35 @@ pub fn parse_def_predecl(working_set: &WorkingSet<'_>, tokens: &[Token]) {
     }
 }
 
+/// Whether the rest parameter of a signature's text has no type, as nu
+/// decides it (`rest_param_is_type_annotated`, on the text): the parameter's
+/// name is the word after the `...` that starts it (`$` included, so `...$r:
+/// string` is typed), and it is typed when some `...name` is followed by a
+/// `:`. `false` without one.
+fn has_untyped_rest(signature: &str) -> bool {
+    let name = signature.match_indices("...").find_map(|(start, _)| {
+        let starts_parameter = signature[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|previous| previous.is_whitespace() || matches!(previous, '[' | '(' | ','));
+        let rest = &signature[start + 3..];
+        let end = rest
+            .find(|next: char| next.is_whitespace() || matches!(next, ',' | ':' | ']' | ')' | '#' | '=' | '?'))
+            .unwrap_or(rest.len());
+        (starts_parameter && end > 0).then(|| &rest[..end])
+    });
+    let Some(name) = name else { return false };
+    let needle = format!("...{name}");
+    !signature.match_indices(&needle).any(|(start, _)| {
+        signature[start + needle.len()..].trim_start_matches(|c: char| c.is_ascii_whitespace()).starts_with(':')
+    })
+}
+
 /// Reject a `def`/`extern`/`alias` name that is a parser keyword, or that
 /// nu refuses because it could never be called: one containing `#`, `^` or
-/// `%`, or one that reads as a number or a filesize (`def 1kb`).
+/// `%`, or one that Rust reads as a float (`1e3`, `inf`) or the `bytesize`
+/// crate as a size (`1k`, `2.5gib`, `"1 kb"`). Nushell's own number syntax
+/// does not count: `def 0x10` and `def 1_000` are fine.
 pub fn check_definition_name(name: &Spanned<Cow<'_, str>>, what: &str) -> ParseResult<()> {
     if is_parser_keyword(&name.item) {
         return Err(cut(Diagnostic::message(
@@ -86,13 +123,40 @@ pub fn check_definition_name(name: &Spanned<Cow<'_, str>>, what: &str) -> ParseR
         .with_help("choose a different name; this word is parsed specially by Nushell")));
     }
     let text: &str = &name.item;
-    if text.contains(['#', '^', '%'])
-        || parse_int(text).is_some()
-        || parse_float(text).is_some()
-        || parse_filesize(text).is_some_and(|filesize| filesize.is_ok())
-    {
+    if text.contains(['#', '^', '%']) || is_byte_size(text) || text.parse::<f64>().is_ok() {
         return Err(cut(Diagnostic::message(format!("{what} name not supported"), name.span)
             .with_help("a name may not contain `#`, `^` or `%`, or read as a number or filesize")));
+    }
+    Ok(())
+}
+
+/// Whether the `bytesize` crate (`ByteSize::from_str`, which nu asks about a
+/// definition name) parses `text`: an integer, or digits and dots making a
+/// float, then optional whitespace and a size unit in any case (`b`, `k`,
+/// `kb`, `ki`, `kib`, and the same for `m`, `g`, `t`, `p` and `e`).
+fn is_byte_size(text: &str) -> bool {
+    const UNITS: [&str; 25] = [
+        "b", "k", "kb", "m", "mb", "g", "gb", "t", "tb", "p", "pb", "e", "eb", "ki", "kib", "mi", "mib", "gi", "gib",
+        "ti", "tib", "pi", "pib", "ei", "eib",
+    ];
+    if text.parse::<u64>().is_ok() {
+        return true;
+    }
+    let number_end = text.find(|c: char| !(c.is_ascii_digit() || c == '.')).unwrap_or(text.len());
+    let (number, unit) = text.split_at(number_end);
+    number.parse::<f64>().is_ok() && UNITS.iter().any(|known| unit.trim_start().eq_ignore_ascii_case(known))
+}
+
+/// A bare `def`/`extern` name that nu does not take for a name: one starting
+/// with `-` (a lone `-`; the others are flags), for which nu takes the next
+/// item that does not start with `-` (`def - [] {}` has "no space between name
+/// and parameters", `extern - []` predeclares a command it then cannot find),
+/// and a spread (`def ...{x: 1} [] {}`), which is no positional.
+fn reject_name_item(working_set: &WorkingSet<'_>, token: &Token) -> ParseResult<()> {
+    let text = working_set.get_span_contents(token.span);
+    if text.starts_with('-') || is_spread(text, b"[{$(") {
+        return Err(cut(Diagnostic::message("command name not supported", token.span)
+            .with_help("a bare command name cannot start with `-` or be a spread; quote it")));
     }
     Ok(())
 }
@@ -120,6 +184,7 @@ pub fn parse_def<'a>(mut tokens: Tokens<'_, 'a>) -> ParseResult<Expression<'a>> 
     let mut call = KeywordCall::start(&mut tokens)?;
     let mut flags = parse_def_flags(&mut tokens)?;
     let Some(name) = call.positional(&mut tokens, "command name")? else { return call.help_call() };
+    reject_name_item(working_set, &name)?;
     let name = parse_def_name(working_set, &name)?;
     check_definition_name(&name, "command")?;
     flags.extend(parse_def_flags(&mut tokens)?);
@@ -135,7 +200,16 @@ pub fn parse_def<'a>(mut tokens: Tokens<'_, 'a>) -> ParseResult<Expression<'a>> 
     };
     let signature = parse_full_signature(working_set, signature_items, false)?;
     let (body_params, body_block) = match body {
-        Some(token) if is_help_flag(working_set, token) && !seen_end_of_options(&tokens) => return call.help_call(),
+        Some(token) if is_help_flag(working_set, token) && !seen_end_of_options(&tokens) => {
+            // nu never looks at the brace after a lone signature item (`def foo
+            // [] {}{} --help`), so its help call does not parse it either.
+            return match signature_items {
+                [_, dropped] if working_set.get_span_contents(dropped.span).starts_with('{') => {
+                    call.help_call_without(dropped)
+                }
+                _ => call.help_call(),
+            };
+        }
         Some(token) => parse_def_body(working_set, token, "definition body closure { ... }")?,
         None if call.wants_help() => return call.help_call(),
         None => return Err(cut(Diagnostic::expected("block", signature_items[0].span.past()))),
@@ -212,6 +286,7 @@ pub fn parse_extern<'a>(mut tokens: Tokens<'_, 'a>) -> ParseResult<Expression<'a
     let working_set = tokens.working_set;
     let mut call = KeywordCall::start(&mut tokens)?;
     let Some(name) = call.positional(&mut tokens, "command name")? else { return call.help_call() };
+    reject_name_item(working_set, &name)?;
     let name = parse_def_name(working_set, &name)?;
     check_definition_name(&name, "command")?;
     call.flags(&mut tokens)?;
@@ -243,7 +318,7 @@ pub fn parse_for<'a>(mut tokens: Tokens<'_, 'a>) -> ParseResult<Expression<'a>> 
             let Some(type_span) = tokens_until("in").parse_next(&mut tokens)?.span() else {
                 return Err(cut(Diagnostic::expected("type", variable.span.past())));
             };
-            Some(parse_type(working_set, type_span)?)
+            Some(parse_var_type(working_set, type_span)?)
         }
         false => None,
     };
@@ -261,8 +336,9 @@ pub fn parse_for<'a>(mut tokens: Tokens<'_, 'a>) -> ParseResult<Expression<'a>> 
     let iterable = tokens.expect_item("value to iterate")?;
     let iterable = Box::new(parse_value(working_set, iterable.span, ExpectedShape::Any)?);
     let Some(block) = call.positional(&mut tokens, "block")? else { return call.help_call() };
-    let body = parse_block_argument(working_set, &block, "block")?;
+    let (body, body_value) = parse_block_or_value_argument(working_set, &block, "block")?;
     call.end(&mut tokens)?;
     let span = call.keyword.span.merge(block.span);
-    call.finish(Expression::new(Expr::For(For { var, ty, in_keyword: in_keyword.span, iterable, body }), span))
+    let for_loop = For { var, ty, in_keyword: in_keyword.span, iterable, body, body_value };
+    call.finish(Expression::new(Expr::For(for_loop), span))
 }

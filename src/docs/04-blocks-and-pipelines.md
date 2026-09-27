@@ -40,8 +40,10 @@ as blocks. It:
 
 The statement loop is a plain `while let` over `peek_token`, not a
 combinator: each token's meaning depends on the one before it (a blank line
-drops pending comments, a `;` after a dangling pipe is an error), and the
-loop says that more directly than a chain of parsers would.
+drops pending comments), and the loop says that more directly than a chain of
+parsers would. A `;` after a `|` with only newlines and comments between is
+refused earlier, by the lexer (nu's `is_complete`, chapter 02), so
+`ls |\n\n; x` never reaches it.
 
 The block's `span` is the span of its *contents*: for a `{ ... }` body that is
 the text between the braces, which is what a formatter needs to re-indent.
@@ -84,20 +86,17 @@ tokens, then each one is parsed.
 
 ```rust,ignore
 fn parse_pipeline<'a>(tokens: &mut Tokens<'_, 'a>, leading_comments: Vec<Comment>)
-    -> ParseResult<(Option<Pipeline<'a>>, Option<Span>)>
+    -> ParseResult<Option<Pipeline<'a>>>
 {
     let mut lite_commands: Vec<(Option<Span>, LiteCommand)> = Vec::new();   // (the `|` before it, the command)
     let mut trailing_comments = Vec::new();
     let mut pipe: Option<Span> = None;
-    let mut dangling = None;
     'commands: loop {
         // A pipeline may start with `|` (`( | str join)`) and `a | | b` is `a | b`.
         while let Some(token) = tokens.peek_token().filter(|token| token.contents == TokenContents::Pipe) {
-            let span = token.span;
+            pipe = Some(token.span);
             tokens.next_token();
-            pipe = Some(span);
-            if let AfterPipe::Dangling = after_pipe(tokens, span, &mut trailing_comments)? {
-                dangling = pipe.take();
+            if let AfterPipe::Dangling = after_pipe(tokens, &mut trailing_comments)? {
                 break 'commands;
             }
         }
@@ -110,22 +109,21 @@ fn parse_pipeline<'a>(tokens: &mut Tokens<'_, 'a>, leading_comments: Vec<Comment
         trailing_comments.extend(lite_command.comments.iter().copied());  // comments between its tokens
         let pipe_after = lite_command.pipe_after;                          // an `e>|` ended the command
         lite_commands.push((pipe.take(), lite_command));
-        if let Some(span) = pipe_after {
-            pipe = Some(span);
-            if let AfterPipe::Dangling = after_pipe(tokens, span, &mut trailing_comments)? {
-                dangling = pipe.take();
+        if pipe_after.is_some() {
+            pipe = pipe_after;
+            if let AfterPipe::Dangling = after_pipe(tokens, &mut trailing_comments)? {
                 break;
             }
         }
     }
-    if lite_commands.is_empty() { return Ok((None, dangling)); }         // only pipes: nu drops the empty command
+    if lite_commands.is_empty() { return Ok(None); }                     // only pipes: nu drops the empty command
     let single = lite_commands.len() == 1;
     for (pipe, lite_command) in &lite_commands {
         let (expr, redirection) = parse_pipeline_element(working_set, lite_command, !single)?;
         elements.push(PipelineElement { span, pipe: *pipe, expr, redirection });
     }
     let terminator = /* a following `;` */;
-    Ok((Some(Pipeline { span, elements, leading_comments, trailing_comments, terminator }), dangling))
+    Ok(Some(Pipeline { span, elements, leading_comments, trailing_comments, terminator }))
 }
 ```
 
@@ -145,10 +143,11 @@ of its kind or backtracks:
   ```
 
   and then reports what comes next: `AfterPipe::Command` when a command
-  follows, `AfterPipe::Dangling` when a blank line or the end of the block
-  does. A dangling `|` closes the pipeline and is dropped silently, as nu
-  drops it: `a |\n\n b` is two pipelines. A `;` right after the continuation
-  is "command after `|`".
+  follows, `AfterPipe::Dangling` when a blank line, a `;` or the end of the
+  block does. A dangling `|` closes the pipeline and is dropped silently, as
+  nu drops it: `a |\n\n b` is two pipelines. The `;` case is reached only
+  after a redirection pipe (`ls e>|; ls` is two pipelines, as in nu): after a
+  plain `|` the lexer has already refused the `;`.
 * `take_pipe_on_later_line` looks *forward* from the end of a command: the
   pipeline continues only through exactly `Eol (Comment Eol)* Pipe`, that is
   one end of line, comment lines each on their own line, and the pipe, which
@@ -178,10 +177,8 @@ A backtrack is only a position (`ParseFailure::NoMatch`, chapter 03), so
 trying `pipe_on_later_line` after every command costs a few token
 comparisons and no allocation.
 
-`parse_pipeline` returns the span of a dangling `|` so that `parse_block` can
-refuse a `;` that follows it (nu's lexer refuses `ls |\n\n; x`), and `None`
-for the pipeline when there was no command at all (a lone `|` before a blank
-line). A `|` that only comments follow at the very end of a block is reported
+`parse_pipeline` returns `None` for the pipeline when there was no command at
+all (a lone `|` before a blank line). A `|` that only comments follow at the very end of a block is reported
 once, by `parse_block` (above), not by `after_pipe`.
 
 ```rust
@@ -273,8 +270,9 @@ redirection and its target are dropped (chapter 06).
 Nushell resolves command names by longest match against known declarations,
 including commands defined *later* in the same block. `parse_def_predecl`
 (in `parse_def.rs`, as in nu-parser) scans the tokens for `def`,
-`export def`, `extern` and `alias` at line starts and registers their names
-in the current scope with `working_set.add_predecl` before any statement is
+`export def`, `extern` and `export extern` at line starts and, when a
+signature item (`[` or `(`) follows the name, registers the name in the
+current scope with `working_set.add_predecl` before any statement is
 parsed:
 
 ```rust
@@ -291,12 +289,13 @@ match &ast.block.pipelines[0].elements[0].expr.expr {
 }
 ```
 
-`parse_def_predecl` also carries nu's duplicate check: a `def` or `extern`
-whose name is followed by a signature item (`[` or `(`) is recorded, and the
-same name recorded twice in one block is "duplicate command definition within
-a block". An `alias` is declared for head resolution but not counted, so
-`def foo` plus `alias foo` is fine, and so is the same name in a nested
-block.
+`parse_def_predecl` also carries nu's duplicate check: the same name
+predeclared twice in one block is "duplicate command definition within a
+block", while the same name in a nested block is fine. An `alias` is never
+predeclared, as in nu: `parse_alias` declares it once its statement is parsed
+(`working_set.add_alias`), so `g 1` before `alias g = echo` calls an unknown,
+external `g`, and `def foo` plus `alias foo` is fine. A call to an alias of an
+external command is an external call (chapter 05).
 
 Scopes are entered and left with `working_set.enter_scope()` and
 `working_set.exit_scope()` by the constructs that create them: subexpressions,

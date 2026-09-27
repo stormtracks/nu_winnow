@@ -7,7 +7,8 @@ Block 0..58
           Use 11..22
             String Bare "std/log" 15..22
         Pipeline 24..36
-          Call `log` 24..36
+          ExternalCall 24..36
+            String Bare "log" 24..27
             String Bare "info" 28..32
             String Double "x" 33..36
   Pipeline 39..57

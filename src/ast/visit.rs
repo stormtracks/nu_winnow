@@ -247,7 +247,7 @@ pub fn walk_expression<'a, V: Visitor<'a> + ?Sized>(visitor: &mut V, expr: &Expr
         Expr::ExportEnv(export_env) => visitor.visit_block(&export_env.body),
         Expr::If(if_expression) => {
             visitor.visit_expression(&if_expression.condition);
-            visitor.visit_block(&if_expression.then_block);
+            walk_block_or_value(visitor, &if_expression.then_block, if_expression.then_value.as_deref());
             if let Some(else_branch) = &if_expression.else_branch {
                 visitor.visit_expression(&else_branch.body);
             }
@@ -270,25 +270,39 @@ pub fn walk_expression<'a, V: Visitor<'a> + ?Sized>(visitor: &mut V, expr: &Expr
                 visitor.visit_type_annotation(ty);
             }
             visitor.visit_expression(&for_loop.iterable);
-            visitor.visit_block(&for_loop.body);
+            walk_block_or_value(visitor, &for_loop.body, for_loop.body_value.as_deref());
         }
         Expr::While(while_loop) => {
             visitor.visit_expression(&while_loop.condition);
-            visitor.visit_block(&while_loop.body);
+            walk_block_or_value(visitor, &while_loop.body, while_loop.body_value.as_deref());
         }
-        Expr::Loop(loop_expression) => visitor.visit_block(&loop_expression.body),
+        Expr::Loop(loop_expression) => {
+            walk_block_or_value(visitor, &loop_expression.body, loop_expression.body_value.as_deref())
+        }
         Expr::Return(return_expression) => {
             if let Some(value) = &return_expression.value {
                 visitor.visit_expression(value);
             }
         }
         Expr::Try(try_expression) => {
-            visitor.visit_block(&try_expression.body);
+            walk_block_or_value(visitor, &try_expression.body, try_expression.body_value.as_deref());
             for handler in &try_expression.handlers {
                 visitor.visit_expression(&handler.body);
             }
         }
         Expr::Where(where_expression) => visitor.visit_expression(&where_expression.condition),
+    }
+}
+
+/// A keyword's block, or the variable or subexpression standing in for it.
+fn walk_block_or_value<'a, V: Visitor<'a> + ?Sized>(
+    visitor: &mut V,
+    block: &Block<'a>,
+    value: Option<&Expression<'a>>,
+) {
+    match value {
+        Some(value) => visitor.visit_expression(value),
+        None => visitor.visit_block(block),
     }
 }
 

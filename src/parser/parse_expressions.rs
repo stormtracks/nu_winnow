@@ -12,8 +12,8 @@ use crate::ast::{
     TypeAnnotation, UnaryNot,
 };
 use crate::error::{Diagnostic, ErrorKind};
-use crate::input::{Input, ParseFailure, ParseResult, cut, input};
-use crate::lex::{LexOptions, Token, TokenContents, lex, lex_n_tokens, next_token};
+use crate::input::{Input, ParseFailure, ParseResult, backtrack, cut, input};
+use crate::lex::{LexOptions, Token, TokenContents, assignment_operator, lex, lex_n_tokens, next_token};
 use crate::span::{Span, Spanned};
 
 use super::WorkingSet;
@@ -28,9 +28,9 @@ use super::parse_def::{parse_def, parse_extern, parse_for};
 use super::parse_helpers::{delimited_interior, garbage, invalid_literal, is_spread};
 use super::parse_keywords::is_statement_keyword;
 use super::parse_literals::{
-    is_datetime, is_range_syntax, looks_like_binary, parse_binary, parse_dollar_expr, parse_duration, parse_filesize,
-    parse_float, parse_full_cell_path, parse_int, parse_number, parse_paren_expr, parse_range, parse_raw_string,
-    parse_simple_cell_path, parse_string, parse_string_literal, radix_prefix,
+    is_datetime, is_range_head, is_range_syntax, looks_like_binary, parse_binary, parse_dollar_expr, parse_duration,
+    parse_filesize, parse_float, parse_full_cell_path, parse_int, parse_number, parse_paren_expr, parse_range,
+    parse_raw_string, parse_simple_cell_path, parse_string, parse_string_literal, radix_prefix,
 };
 use super::parse_module::{parse_export_env, parse_export_in_block, parse_module, parse_use};
 use super::parse_patterns::pattern;
@@ -101,6 +101,7 @@ pub fn parse_expression<'a>(mut tokens: Tokens<'_, 'a>, position: Position) -> P
 /// `parse_builtin_commands`). `if`, `loop`, ... are ordinary commands in nu,
 /// so a definition in the file shadows them; the statement keywords cannot be
 /// shadowed.
+#[inline]
 pub fn parse_builtin_commands<'a>(tokens: Tokens<'_, 'a>) -> ParseResult<Expression<'a>> {
     let working_set = tokens.working_set;
     let Some(first) = tokens.peek_token() else {
@@ -177,23 +178,30 @@ fn parse_env_shorthand_prefix<'a>(tokens: &mut Tokens<'_, 'a>) -> ParseResult<Ve
     repeat(0.., env_assignment).parse_next(tokens)
 }
 
-/// One `NAME=value` item: an item with a valid variable name before its `=`.
+/// One `NAME=value` item: an item with a valid variable name before its `=`
+/// and a value that parses. Like nu, a value that does not parse (`A='b'c`)
+/// ends the shorthand without an error: from that item on, the text is the
+/// command (an external `A='b'c`).
 fn env_assignment<'a>(tokens: &mut Tokens<'_, 'a>) -> ParseResult<EnvAssignment<'a>> {
     let working_set = tokens.working_set;
     let (token, equals) = item
         .verify_map(|token| {
             let text = working_set.get_span_contents(token.span);
-            let equals = text.find('=').filter(|equals| is_env_variable_name(&text[..*equals]))?;
+            // A byte scan: most items have no `=`, and this runs for every command.
+            let equals = text.bytes().position(|byte| byte == b'=')?;
+            is_env_variable_name(&text[..equals]).then_some(())?;
             Some((token, equals))
         })
         .parse_next(tokens)?;
     let text = tokens.text(&token);
     let value_span = Span::new(token.span.start + equals + 1, token.span.end);
     let value = match &text[equals + 1..] {
-        "" => Expression::new(Expr::String(StringLiteral::bare("")), value_span),
-        value if value.starts_with('$') => parse_value(working_set, value_span, ExpectedShape::Any)?,
-        _ => Expression::new(Expr::String(parse_string_literal(working_set, value_span)?), value_span),
+        "" => Ok(Expression::new(Expr::String(StringLiteral::bare("")), value_span)),
+        value if value.starts_with('$') => parse_value(working_set, value_span, ExpectedShape::Any),
+        _ => parse_string_literal(working_set, value_span)
+            .map(|string| Expression::new(Expr::String(string), value_span)),
     };
+    let value = value.map_err(|_| backtrack(token.span.start))?;
     let name = Spanned::new(&text[..equals], Span::new(token.span.start, token.span.start + equals));
     Ok(EnvAssignment { span: token.span, name, value })
 }
@@ -236,17 +244,16 @@ fn parse_assignment_expression<'a>(tokens: Tokens<'_, 'a>) -> ParseResult<Expres
     let rhs = parse_block(rhs, rhs_span);
     // Since 0.97 nu refuses an external command as the start of the value
     // unless it is written with a caret: `$x = git` is an error, `$x = ^git`
-    // is not. Needs the command table; decided only when one is configured.
+    // is not. A bare external head needs the command table (or an alias of
+    // an external command), so without one this never fires.
     if let Some(first) = rhs.pipelines.first().and_then(|pipeline| pipeline.elements.first())
-        && let Expr::Call(call) = &first.expr.expr
-        && call.sigil.is_none()
-        && working_set.has_builtin_decls()
-        && working_set.find_decl(&call.head.name).is_none()
+        && let Expr::ExternalCall(call) = &first.expr.expr
+        && call.caret.is_none()
     {
+        let name = working_set.get_span_contents(call.head.span);
         return Err(cut(Diagnostic::message("external command calls must be explicit in assignments", call.head.span)
             .with_help(format!(
-                "`{}` is not a known command; write `^{}` to run it and capture its output, or quote the string",
-                call.head.name, call.head.name
+                "`{name}` is not a known command; write `^{name}` to run it and capture its output, or quote the string"
             ))));
     }
     let span = lhs.span.merge(rhs_span);
@@ -659,7 +666,7 @@ pub fn is_math_expression_like(text: &str) -> bool {
                 || parse_duration(text).is_some_and(|duration| duration.is_ok())
                 || is_datetime(text)
                 || looks_like_binary(text)
-                || is_range_syntax(text)
+                || is_range_head(text)
         }
     }
 }
@@ -715,6 +722,39 @@ pub fn brace_shape(working_set: &WorkingSet<'_>, span: Span) -> ParseResult<Brac
     Ok(probe_brace_shape(working_set, inner))
 }
 
+/// The text between the first and the last character of a `{` item, which is
+/// what nu's `parse_brace_expr` probes: a tail such as the `.a` of `{a: 1}.a`
+/// is included. nu cuts one byte; here the whole last character, so that a
+/// multi-byte one (`{a: 1}╮`) is not split.
+fn brace_probe_interior(working_set: &WorkingSet<'_>, span: Span) -> Span {
+    let last = working_set.get_span_contents(span).chars().next_back().map_or(0, char::len_utf8);
+    Span::new(span.start + 1, (span.end - last).max(span.start + 1))
+}
+
+/// A `{` item that nu reads as a record, or as a cell path on one, whatever
+/// shape it wants (nu's `parse_brace_expr` decides this first): the second
+/// token of [`brace_probe_interior`] is `:` (`{a: 1}`, `{ $env.A:b }`,
+/// `{a: 1}.a`). `None` for anything else.
+pub fn parse_brace_record<'a>(working_set: &WorkingSet<'a>, span: Span) -> ParseResult<Option<Expression<'a>>> {
+    if probe_brace_shape(working_set, brace_probe_interior(working_set, span)) != BraceShape::Record {
+        return Ok(None);
+    }
+    parse_full_cell_path(working_set, span, false).map(Some)
+}
+
+/// Whether nu types this record `record<...>`: every key a string that is not
+/// raw (nu's `Expr::String`) and every spread such a record. Any other record
+/// (`{ $env.A: b }`, `{(k): 1}`), and a cell path on one, is `any` to nu.
+pub fn is_typed_record(expr: &Expression<'_>) -> bool {
+    let Expr::Record(items) = &expr.expr else { return false };
+    items.iter().all(|item| match item {
+        RecordItem::Pair { key, .. } => {
+            matches!(&key.expr, Expr::String(string) if !matches!(string.quote, Quote::Raw(_)))
+        }
+        RecordItem::Spread { expr, .. } => is_typed_record(expr),
+    })
+}
+
 /// `{ ... }`: a record, a closure or a block, decided as `nu-parser` does
 /// from the first two tokens of the body and the surrounding shape.
 fn parse_brace_expr<'a>(
@@ -724,8 +764,22 @@ fn parse_brace_expr<'a>(
 ) -> ParseResult<Expression<'a>> {
     let text = working_set.get_span_contents(span);
     if !text.ends_with('}') {
-        // `{a: 1}.a`
-        return parse_full_cell_path(working_set, span, false);
+        // `{a: 1}.a`. Like nu, the kind is decided from the text between the
+        // first and the last character, tail included: a record (`key :`) or a
+        // first token `}` (`{}.a`) is a cell path, anything else a closure,
+        // block or record that never closes (`{#a: 1}.a`, `{...$r}.a`).
+        let inner = brace_probe_interior(working_set, span);
+        let rest = working_set.get_span_contents(inner);
+        let first_is_close = rest
+            .lines()
+            .map(str::trim_start)
+            .find(|line| !line.is_empty() && !line.starts_with('#'))
+            .is_some_and(|line| line.starts_with('}'));
+        if first_is_close || probe_brace_shape(working_set, inner) == BraceShape::Record {
+            return parse_full_cell_path(working_set, span, false);
+        }
+        let open = Span::new(span.start, span.start + 1);
+        return Err(cut(Diagnostic::new(ErrorKind::Unclosed { delimiter: "}", open }, span.past())));
     }
     let inner = Span::new(span.start + 1, span.end - 1);
     match (probe_brace_shape(working_set, inner), shape) {
@@ -786,8 +840,14 @@ pub fn parse_closure_expression<'a>(working_set: &WorkingSet<'a>, span: Span) ->
 pub fn parse_closure_parts<'a>(working_set: &WorkingSet<'a>, span: Span) -> ParseResult<Closure<'a>> {
     let inner = delimited_interior(working_set, span, "{", "}")?;
     let tokens = lex(working_set.get_span_contents(inner), inner.start, LexOptions::BLOCK).map_err(cut)?;
-    // The parameter list may start on a later line: `{\n  |x| ... }`.
-    let first = tokens.iter().position(|token| token.contents != TokenContents::Eol).unwrap_or(tokens.len());
+    // The parameter list is the first token or, as nu's lexer merges a newline
+    // and the `|` after it, the `|` right after one newline (`{\n  |x| ... }`).
+    // After a comment line or a blank line, and for `||` on a later line, the
+    // pipes belong to the body (`{\n|| 1}` is `||` in a block).
+    let first = match (tokens.first().map(|token| token.contents), tokens.get(1).map(|token| token.contents)) {
+        (Some(TokenContents::Eol), Some(TokenContents::Pipe)) => 1,
+        _ => 0,
+    };
     let (params, body_start) = match tokens.get(first).map(|token| token.contents) {
         Some(TokenContents::Pipe) => {
             let open = tokens[first];
@@ -804,12 +864,10 @@ pub fn parse_closure_parts<'a>(working_set: &WorkingSet<'a>, span: Span) -> Pars
                 .with_context("closure parameters")));
             };
             let close = tokens[close_index];
-            let signature = parse_signature_helper(
-                working_set,
-                Span::new(open.span.end, close.span.start),
-                open.span.merge(close.span),
-                false,
-            )?;
+            // Like nu, the parameters are lexed with their pipes, so a trailing
+            // `=` or `:` is not the last token (`{|x=| }` parses).
+            let pipes = open.span.merge(close.span);
+            let signature = parse_signature_helper(working_set, pipes, pipes, false)?;
             (Some(signature), close_index + 1)
         }
         Some(TokenContents::PipePipe) => {
@@ -922,6 +980,7 @@ fn parse_table_expression<'a>(
                 | Expr::StringInterpolation(_)
                 | Expr::Var(_)
                 | Expr::FullCellPath(_)
+                | Expr::CellPath(_)
                 | Expr::Subexpression(_)
         );
         if !stringy {
@@ -1088,9 +1147,17 @@ pub fn parse_match_block_expression<'a>(working_set: &WorkingSet<'a>, span: Span
     let inner = delimited_interior(working_set, span, "{", "}")?;
     let lexed = lex(working_set.get_span_contents(inner), inner.start, LexOptions::MATCH).map_err(cut)?;
     working_set.add_comments(&lexed);
+    // nu reads the arms by the text of each token, so a word that lexes as an
+    // operator or a redirection (`=`, `o>`) is an ordinary pattern or body.
     let lexed: Vec<Token> = lexed
         .into_iter()
         .filter(|token| !matches!(token.contents, TokenContents::Comment | TokenContents::Eol | TokenContents::Eof))
+        .map(|token| match token.contents {
+            TokenContents::AssignmentOperator(_) | TokenContents::Redirection(_) => {
+                Token { contents: TokenContents::Item, span: token.span }
+            }
+            _ => token,
+        })
         .collect();
     let mut tokens = Tokens::new(working_set, &lexed, inner.end);
     repeat_till(0.., parse_match_arm, eof).map(|(arms, _)| arms).parse_next(&mut tokens)
@@ -1124,15 +1191,31 @@ fn parse_match_guard<'a>(tokens: &mut Tokens<'_, 'a>) -> ParseResult<Box<Express
         return Err(cut(Diagnostic::expected("expression after `if` in match guard", if_keyword.span.past())
             .with_help("the `if` keyword must be followed by an expression")));
     }
-    Ok(Box::new(parse_math_expression(condition)?))
+    // Like nu, every token up to the `=>` is a word of the guard (`$a if ; => 1`).
+    let items: Vec<Token> =
+        condition.remaining().iter().map(|token| Token { contents: TokenContents::Item, span: token.span }).collect();
+    let end = condition.end_span().start;
+    Ok(Box::new(parse_math_expression(Tokens::new(tokens.working_set, &items, end))?))
 }
 
 /// The body of an arm is one item: a block (or a record or closure when it
 /// looks like one), otherwise an expression.
 fn parse_match_arm_body<'a>(tokens: &mut Tokens<'_, 'a>) -> ParseResult<Expression<'a>> {
-    let body = tokens.expect_item("match arm body")?;
+    // Like nu, the body is the next token whatever it is: `1 => |` and `1 => ;`
+    // are calls to commands named `|` and `;`.
+    let Some(&body) = tokens.next_token() else {
+        return Err(cut(Diagnostic::expected("match arm body", tokens.here())));
+    };
+    // An assignment operator is still one (`1 => =` is an assignment with no sides).
+    if assignment_operator(tokens.working_set.get_span_contents(body.span)).is_some() {
+        return Err(cut(Diagnostic::expected("match arm body", body.span)));
+    }
+    let body = Token { contents: TokenContents::Item, span: body.span };
     match tokens.text(&body).starts_with('{') {
         true => parse_value(tokens.working_set, body.span, ExpectedShape::MatchArmBody),
-        false => parse_expression(tokens.slice(tokens.position() - 1..tokens.position()), Position::Element),
+        false => parse_expression(
+            Tokens::new(tokens.working_set, std::slice::from_ref(&body), body.span.end),
+            Position::Element,
+        ),
     }
 }

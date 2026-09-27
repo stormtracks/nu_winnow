@@ -46,7 +46,7 @@ enum name), with which its default value is parsed
 | `Error` | n/a (a runtime value) | `accept/try/catch.nu` | `try_forms` |
 | `Expression` | `parse_expressions::parse_expression` | `accept/if/else-expression.nu` `accept/match/body-forms.nu` | `if_forms` `match_forms` |
 | `ExternalArgument` | `parse_calls::parse_external_arg`, `parse_external_string`, `check_external_list_argument` (a `[` argument must end with `]`) | `accept/externals/arg-*.nu` `reject/externals/*.nu` | `external_call_string_args` `external_call_structured_args` |
-| `Filepath` | bare string; n/a without a signature | `accept/strings/bare-word.nu` `accept/externals/relative-path-command.nu` | `relative_path_is_a_command_head` |
+| `Filepath` | bare string; n/a without a signature | `accept/strings/bare-word.nu` `accept/externals/relative-path-command.nu` | `relative_path_is_an_external_command` |
 | `Filesize` | `parse_literals::parse_filesize` | `accept/literals/filesize-*.nu` `reject/literals/filesize-*.nu` | `filesizes` |
 | `Float` | `parse_literals::parse_float` | `accept/literals/float-*.nu` | `floats` |
 | `FullCellPath` | `parse_literals::parse_full_cell_path` | `accept/cellpaths/*.nu` `reject/variables/*.nu` | `variables_and_cell_paths` `cell_path_members` |
@@ -190,7 +190,7 @@ the two over real files.
 | `Directory` | `FlatShape::String` (needs a signature) | `accept/strings/bare-word.nu` | `shapes_cover_source_in_order_without_overlap` |
 | `External` | `FlatShape::External` | `accept/externals/caret-simple.nu` | `shapes_cover_source_in_order_without_overlap` |
 | `ExternalArg` | `FlatShape::ExternalArg` | `accept/externals/caret-args.nu` | `shapes_cover_source_in_order_without_overlap` |
-| `ExternalResolved` | `FlatShape::InternalCall` (unknown heads are calls) | `accept/externals/unknown-command-is-call.nu` | `relative_path_is_a_command_head` |
+| `ExternalResolved` | n/a (nu-cli's highlighter marks an external found on `PATH`; nu-parser's flatten gives an unknown head `External`, as `flatten()` does) | `accept/externals/unknown-command-is-external.nu` | `relative_path_is_an_external_command` |
 | `Filepath` | `FlatShape::String` (needs a signature) | `accept/strings/bare-word.nu` | `shapes_cover_source_in_order_without_overlap` |
 | `Flag` | `FlatShape::Flag` | `accept/calls/long-flags.nu` | `shapes_cover_source_in_order_without_overlap` |
 | `Float` | `FlatShape::Float` | `accept/literals/float-simple.nu` | `shapes_cover_source_in_order_without_overlap` |
@@ -281,7 +281,7 @@ signatures, types or files and is left to the consumer.
 | `CantHideDefaultOverlay` | n/a (semantic: overlays) | `accept/modules/overlay.nu` | `use_forms` |
 | `CantAddOverlayHelp` | n/a (semantic: overlays) | `accept/modules/overlay.nu` | `use_forms` |
 | `DuplicateCommandDef` | `parse_def::parse_def_predecl` (the same `def`/`extern` name predeclared twice in one block); across modules and files: semantic | `reject/def/duplicate-*.nu` `accept/def/same-name-in-nested-block.nu` `accept/modules/module-inline.nu` | `extern_alias_module_use_export` |
-| `UnknownCommand` | n/a (unknown heads are calls) | `accept/externals/unknown-command-is-call.nu` | `external_calls` |
+| `UnknownCommand` | env shorthand without a command (`FOO=1` alone, `parse_expressions::parse_expression`); an unknown attribute name: consumer. An unknown head is not an error but an external call (`parse_calls::parse_call`) | `reject/env-shorthand/shorthand-alone.nu` `accept/externals/unknown-command-is-external.nu` `accept/attributes/unknown-attribute-name-is-consumer.nu` | `external_calls` `env_shorthand` |
 | `UnknownFlag` | `ErrorKind::Message` (`doesn't have flag`) for the statements and the keyword commands (`parse_keywords::keyword_boundary`, `parse_calls::check_call`); n/a for ordinary commands | `reject/calls/hide-unknown-long-flag.nu` `reject/loops/return-unknown-flag.nu` `accept/calls/long-flags.nu` | `multiword_commands_and_flags` |
 | `UnknownType` | `ErrorKind::UnknownType` | `reject/def/unknown-type.nu` `reject/bindings/let-unknown-type.nu` | `def_forms` |
 | `MissingFlagParam` | `ErrorKind::Message` for the keyword commands (`parse_calls::check_call`); n/a for ordinary commands | `reject/calls/overlay-hide-keep-env-without-value.nu` `accept/calls/flag-followed-by-value.nu` | `multiword_commands_and_flags` |

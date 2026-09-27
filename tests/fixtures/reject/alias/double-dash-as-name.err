@@ -1,7 +1,6 @@
-error: alias name not supported
-  --> reject/alias/double-dash-as-name.nu:1:7
+error: expected `=`
+  --> reject/alias/double-dash-as-name.nu:1:10
   |
 1 | alias -- x = ls
-  |       ^^
+  |          ^
   = while parsing alias
-  = help: a bare alias name cannot start with `-`; quote it

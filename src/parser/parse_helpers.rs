@@ -14,6 +14,25 @@ pub fn is_identifier(name: &str) -> bool {
     !name.is_empty() && !name.bytes().any(|byte| b".[({+-*^%/=!<>&|".contains(&byte))
 }
 
+/// Whether `text` can declare a variable (nu's `is_variable`): `$name` or
+/// `name` with an identifier name. A bare `$` qualifies too, as in nu, where it
+/// declares a variable that no expression can refer to (`let $ = 1`).
+pub fn is_variable(text: &str) -> bool {
+    match text.strip_prefix('$') {
+        Some(name) if !name.is_empty() => is_identifier(name),
+        _ => is_identifier(text),
+    }
+}
+
+/// The name a variable declaration `text` declares, and its offset in `text`:
+/// without the leading `$`, except for a bare `$`.
+pub fn declared_variable_name(text: &str) -> (usize, &str) {
+    match text.strip_prefix('$') {
+        Some(name) if !name.is_empty() => (1, name),
+        _ => (0, text),
+    }
+}
+
 /// `true` for `...x` where `x` starts with one of `heads`.
 pub fn is_spread(text: &str, heads: &[u8]) -> bool {
     text.len() > 3 && text.starts_with("...") && heads.contains(&text.as_bytes()[3])

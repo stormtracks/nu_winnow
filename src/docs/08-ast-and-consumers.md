@@ -93,9 +93,9 @@ value` binds the value (an `Argument::Named` whose `NamedArgument::value` is
 `None` followed by an `Argument::Positional`), whether `-1` is a flag or a
 number, and whether a positional has the right shape or count; whether a
 bare word is a cell path or a glob (it is a `String` with `Quote::Bare`);
-whether a bare head is internal or external (always `Call`; only `^` gives
-`ExternalCall`; with a command table configured, an unknown head in an
-assignment rhs is refused as nu does); spread validity; constant evaluation
+the commands a `use`d module brings into scope (without them in the
+`ParseConfig`, `use std/log; log info x` is an external call to `log`);
+spread validity; constant evaluation
 (defaults, completers, match value patterns, `use` and `source` arguments);
 whether a completer's or an attribute's command exists; types; module, file,
 overlay and plugin resolution; variable existence. The keyword commands that

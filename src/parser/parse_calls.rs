@@ -8,7 +8,7 @@ use winnow::Parser;
 
 use crate::ast::{
     Argument, Attribute, Call, CallHead, DynamicCall, Expr, Expression, ExternalArgument, ExternalCall,
-    InterpolationPart, NamedArgument, Quote, StringInterpolation, StringLiteral,
+    InterpolationPart, NamedArgument, Quote, StringInterpolation, StringLiteral, SyntaxShape,
 };
 use crate::error::{Diagnostic, ErrorKind};
 use crate::input::{ParseResult, cut};
@@ -19,7 +19,9 @@ use super::WorkingSet;
 use super::parse_expressions::{ExpectedShape, parse_value};
 use super::parse_helpers::is_spread;
 use super::parse_literals::{parse_raw_string, parse_string};
+use super::parse_module::parse_import_pattern_member;
 use super::tokens::{Tokens, expected, item, repeat_to_end};
+use super::working_set::DeclKind;
 
 /// The most words that can form a known multi-word command.
 const MAX_COMMAND_WORDS: usize = 5;
@@ -32,6 +34,11 @@ const MAX_COMMAND_WORDS: usize = 5;
 /// head     = the longest known command name (`str trim`), else one word
 /// argument = "--" | "--" name [ "=" value ] | "-" flags | "..." value | value
 /// ```
+///
+/// A head that resolves to no command is an external command, as in nu: its
+/// arguments are external arguments (`git log 0b2d1f4..HEAD`), and so are
+/// those of an alias of an external command. Deciding that needs the command
+/// table; with none configured every head is a call.
 pub fn parse_call<'a>(tokens: Tokens<'_, 'a>) -> ParseResult<Expression<'a>> {
     parse_call_lenient(tokens, false)
 }
@@ -47,24 +54,22 @@ pub fn parse_call_lenient<'a>(mut tokens: Tokens<'_, 'a>, lenient: bool) -> Pars
         _ => {}
     }
     let head = find_longest_decl(first, &mut tokens, "");
-    let arguments = parse_call_arguments(tokens)?;
+    let wrapped = match working_set.find_decl(&head.name) {
+        Some(DeclKind::ExternalAlias) => {
+            let name = StringLiteral { value: head.name, quote: Quote::Bare };
+            let name = Expression::new(Expr::String(name), head.span);
+            return parse_external_arguments(None, name, tokens);
+        }
+        None if working_set.has_builtin_decls() => {
+            let name = parse_external_string(working_set, head.span)?;
+            return parse_external_arguments(None, name, tokens);
+        }
+        kind => kind == Some(DeclKind::Wrapped),
+    };
+    let arguments = parse_call_arguments_with(tokens, wrapped)?;
     let span = first.span.merge(arguments.last().map_or(head.span, Argument::span));
     let call = Call { head, arguments, sigil: None };
     check_call(working_set, &call, lenient)?;
-    // An unknown bare head is an external command for nu, whose `[` arguments
-    // go through the list parser alone (`cmd [a].0` is unclosed, `echo [a].0`
-    // is a cell path). Needs the command table; decided only when one is
-    // configured, like the assignment rule.
-    if working_set.has_builtin_decls() && working_set.find_decl(&call.head.name).is_none() {
-        for argument in &call.arguments {
-            let value_span = match argument {
-                Argument::Positional(expr) => expr.span,
-                Argument::Spread { expr, .. } => expr.span,
-                _ => continue,
-            };
-            check_external_list_argument(working_set, value_span)?;
-        }
-    }
     Ok(Expression::new(Expr::Call(call), span))
 }
 
@@ -161,13 +166,34 @@ fn is_negative_number_like(text: &str) -> bool {
 }
 
 /// The arguments of a call: flags, positionals, spreads and `--`.
-fn parse_call_arguments<'a>(mut tokens: Tokens<'_, 'a>) -> ParseResult<Vec<Argument<'a>>> {
-    repeat_to_end(parse_call_argument).parse_next(&mut tokens)
+fn parse_call_arguments<'a>(tokens: Tokens<'_, 'a>) -> ParseResult<Vec<Argument<'a>>> {
+    parse_call_arguments_with(tokens, false)
+}
+
+/// The arguments of a call; `wrapped` for a [`DeclKind::Wrapped`] command,
+/// whose values are parsed with the `external_arg` shape (`f 'x'$`, `f 0b2`).
+fn parse_call_arguments_with<'a>(mut tokens: Tokens<'_, 'a>, wrapped: bool) -> ParseResult<Vec<Argument<'a>>> {
+    match wrapped {
+        true => repeat_to_end(parse_wrapped_call_argument).parse_next(&mut tokens),
+        false => repeat_to_end(parse_call_argument).parse_next(&mut tokens),
+    }
 }
 
 /// One argument of a call. Without the command's signature a flag never
 /// takes the next item as its value; only `--name=value` has one.
 fn parse_call_argument<'a>(tokens: &mut Tokens<'_, 'a>) -> ParseResult<Argument<'a>> {
+    call_argument(tokens, false)
+}
+
+/// One argument of a call to a wrapped command.
+fn parse_wrapped_call_argument<'a>(tokens: &mut Tokens<'_, 'a>) -> ParseResult<Argument<'a>> {
+    call_argument(tokens, true)
+}
+
+/// [`parse_call_argument`], its values parsed as external arguments when
+/// `wrapped`.
+#[inline(always)]
+fn call_argument<'a>(tokens: &mut Tokens<'_, 'a>, wrapped: bool) -> ParseResult<Argument<'a>> {
     let token = expected("argument", item).parse_next(tokens)?;
     let working_set = tokens.working_set;
     let text = tokens.text(&token);
@@ -180,7 +206,7 @@ fn parse_call_argument<'a>(tokens: &mut Tokens<'_, 'a>) -> ParseResult<Argument<
                 Some((_, "")) => return Err(cut(Diagnostic::expected("value after `=`", span.past()))),
                 Some((name, _)) => {
                     let value_span = Span::new(span.start + 3 + name.len(), span.end);
-                    (name, Some(Box::new(parse_value(working_set, value_span, ExpectedShape::Any)?)))
+                    (name, Some(Box::new(parse_argument_value(working_set, value_span, wrapped)?)))
                 }
                 None => (rest, None),
             };
@@ -194,13 +220,22 @@ fn parse_call_argument<'a>(tokens: &mut Tokens<'_, 'a>) -> ParseResult<Argument<
             let value_span = Span::new(span.start + 3, span.end);
             Argument::Spread { dots, expr: parse_value(working_set, value_span, ExpectedShape::Any)? }
         }
-        _ => Argument::Positional(parse_value(working_set, span, ExpectedShape::Any)?),
+        _ => Argument::Positional(parse_argument_value(working_set, span, wrapped)?),
     })
+}
+
+/// The value of an argument: any value, or for a wrapped command an external
+/// argument.
+fn parse_argument_value<'a>(working_set: &WorkingSet<'a>, span: Span, wrapped: bool) -> ParseResult<Expression<'a>> {
+    match wrapped {
+        true => parse_value(working_set, span, ExpectedShape::Declared(&SyntaxShape::ExternalArgument)),
+        false => parse_value(working_set, span, ExpectedShape::Any),
+    }
 }
 
 /// `^cmd args...` (nu's `parse_external_call`); `first` is the `^cmd` item,
 /// already consumed.
-fn parse_external_call<'a>(first: Token, mut tokens: Tokens<'_, 'a>) -> ParseResult<Expression<'a>> {
+fn parse_external_call<'a>(first: Token, tokens: Tokens<'_, 'a>) -> ParseResult<Expression<'a>> {
     let working_set = tokens.working_set;
     let caret = Span::new(first.span.start, first.span.start + 1);
     let head_span = Span::new(first.span.start + 1, first.span.end);
@@ -210,8 +245,19 @@ fn parse_external_call<'a>(first: Token, mut tokens: Tokens<'_, 'a>) -> ParseRes
         Some(_) => parse_external_string(working_set, head_span)?,
         None => Expression::new(Expr::String(StringLiteral::bare("")), head_span),
     };
+    parse_external_arguments(Some(caret), head, tokens)
+}
+
+/// The arguments of an external call to `head`, which starts at `caret`
+/// when there is one, and the call.
+fn parse_external_arguments<'a>(
+    caret: Option<Span>,
+    head: Expression<'a>,
+    mut tokens: Tokens<'_, 'a>,
+) -> ParseResult<Expression<'a>> {
     let arguments = repeat_to_end(parse_external_call_argument).parse_next(&mut tokens)?;
-    let span = first.span.merge(arguments.last().map_or(first.span, ExternalArgument::span));
+    let start = caret.unwrap_or(head.span);
+    let span = start.merge(arguments.last().map_or(head.span, ExternalArgument::span));
     Ok(Expression::new(Expr::ExternalCall(ExternalCall { caret, head: Box::new(head), arguments }), span))
 }
 
@@ -539,7 +585,18 @@ pub fn check_call(working_set: &WorkingSet<'_>, call: &Call<'_>, lenient: bool) 
     if keyword_signature(&call.head.name).is_none() {
         arguments.next();
     }
-    check_call_arguments(working_set, &call.head.name, &signature, arguments, lenient)
+    check_call_arguments(working_set, &call.head.name, &signature, arguments, lenient)?;
+    // nu's `parse_hide` hands the members to `parse_import_pattern`, like
+    // `use` (`hide foo null` is a wrong import pattern); an alias target is
+    // only parsed as a call.
+    if call.head.name == "hide"
+        && !lenient
+        && let Some(members) = call.positional_iter().nth(1)
+    {
+        let token = Token { contents: TokenContents::Item, span: members.span };
+        parse_import_pattern_member(working_set, &token, false)?;
+    }
+    Ok(())
 }
 
 /// [`check_call`] for a call whose head is known by `name` (an attribute: `attr example`).

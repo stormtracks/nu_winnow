@@ -13,12 +13,13 @@
 # Rungs (and what "good" looks like):
 #   cargo test              unit, syntax, fixture, language, example, corpus, traceability, nufmt: 0 failures
 #   fixtures-compare        ours vs nu-check vs nu-parser over tests/fixtures: 0 rows where ours != expected
+#   command table           src/builtin_commands.rs lists exactly the commands of the harness's engine
 #   differential            nu-parser vs ours, in process, over fixtures, corpora, the command examples
-#                           and the book: 0 ours_rejects, 0 nu_syntax_rejects, 0 panics; mutants show a few
-#                           residual disagreements and the documented "known differences"
+#                           and the book, and 3 mutants of each: 0 ours_rejects, 0 nu_syntax_rejects, 0 panics.
+#                           No difference is tolerated silently: `differential --details` prints every disagreement
 #   nucheck-compare         nu-check vs ours over nu_scripts and nu-std: 0 files nu accepts that we reject
 #   flatcmp                 nu's `ast --flatten` vs ours over nu-std: differences are the documented ones
-#   nufmt-fixtures          the formatter reproduces the nushell/nufmt reference fixtures: 111 of 130 today
+#   nufmt-fixtures          the formatter reproduces the nushell/nufmt reference fixtures: 114 of 130 today
 #   traceability            every nu-parser construct is mapped (part of cargo test, listed for visibility)
 
 # Run a command line, returning {ok, stdout} without failing the script.
@@ -46,11 +47,15 @@ export def main [
         print "building the parse and nufmt examples and the harness..."
         cargo build --release --example parse --example nufmt
         cd $harness
-        cargo build --release --bin differential --bin nu-parser-check
+        cargo build --release --bin differential --bin nu-parser-check --bin builtin-commands
         cd $root
     }
 
     mut rows = []
+
+    print "command table..."
+    let table = run-capture nu tools/scripts/gen-builtin-commands.nu --check
+    $rows ++= [{rung: "command table", metric: "matches the harness engine", value: $table.ok, ok: $table.ok}]
 
     print "cargo test..."
     let tests = run-capture cargo test --all-features
@@ -86,7 +91,6 @@ export def main [
             $rows ++= [{rung: $"differential ($set)", metric: "ours rejects, nu accepts", value: $s.ours_rejects, ok: ($s.ours_rejects == 0)}]
             $rows ++= [{rung: $"differential ($set)", metric: "nu rejects (syntax), ours accepts", value: $s.nu_syntax_rejects, ok: ($s.nu_syntax_rejects == 0)}]
             $rows ++= [{rung: $"differential ($set)", metric: "nu rejects (semantic)", value: $s.nu_semantic_rejects, ok: true}]
-            $rows ++= [{rung: $"differential ($set)", metric: "known differences", value: $s.known, ok: true}]
             $rows ++= [{rung: $"differential ($set)", metric: "panics", value: $s.panics, ok: ($s.panics == 0)}]
         }
     }

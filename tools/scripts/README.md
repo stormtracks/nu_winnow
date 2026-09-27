@@ -6,8 +6,9 @@ All scripts run with `nu` 0.115.2 and need the example binary built with
 `cargo build --release --example parse`.
 
 * `verify.nu` — the whole verification ladder with a scoreboard (`cargo
-  test`, `fixtures-compare`, `differential`, `nucheck-compare`, `flatcmp`,
-  `nufmt-fixtures`); `--save FILE` keeps a dated history.
+  test`, the command table, `fixtures-compare`, `differential`,
+  `nucheck-compare`, `flatcmp`, `nufmt-fixtures`); `--save FILE` keeps a dated
+  history.
 * `extract-corpus.nu` — regenerates `tests/corpus/snippets/*.json` (every
   built-in command's examples and the book's code blocks) from checkouts of
   nushell and nushell.github.io.
@@ -29,6 +30,10 @@ All scripts run with `nu` 0.115.2 and need the example binary built with
   it exists, and reports which `tests/fixtures/expected` files it reproduces;
   `--diff NAME` prints the diff for one fixture. Needs
   `cargo build --release --example nufmt`.
+* `gen-builtin-commands.nu` — regenerates `src/builtin_commands.rs`, the
+  commands `ParseConfig::new()` knows and their `CommandType`, from the
+  `builtin-commands` binary of `tools/nushell-harness` (the `nu` binary's
+  engine, no plugins). `--check` exits 1 when the file is stale.
 * `gen-std-commands.nu [STD_DIR]` — regenerates `std_commands.txt`, the list
   of standard-library exports both bare and module-prefixed.
 * `gen-grammar.nu` — regenerates `grammar/grammar.bnf` (the ```` ```ebnf ````
@@ -48,6 +53,7 @@ nu tools/scripts/fixtures-compare.nu
 nu tools/scripts/nucheck-compare.nu ~/src/nu_scripts ~/src/nushell/crates/nu-std
 nu tools/scripts/flatcmp.nu --commands tools/scripts/std_commands.txt ...(glob ~/src/nushell/crates/nu-std/**/*.nu)
 nu tools/scripts/nufmt-fixtures.nu --diff closure
+nu tools/scripts/gen-builtin-commands.nu --check
 nu tools/scripts/gen-std-commands.nu ~/src/nushell/crates/nu-std | save -f tools/scripts/std_commands.txt
 nu tools/scripts/gen-grammar.nu --check
 ```

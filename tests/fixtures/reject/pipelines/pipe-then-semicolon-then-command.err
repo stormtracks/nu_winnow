@@ -1,6 +1,6 @@
-error: unexpected end of input, expected command after `|`
-  --> reject/pipelines/pipe-then-semicolon-then-command.nu:1:4
+error: extra tokens after the end of the expression
+  --> reject/pipelines/pipe-then-semicolon-then-command.nu:1:6
   |
 1 | ls | ; pwd
-  |    ^
-  = while parsing pipeline
+  |      ^
+  = help: a `|` must be followed by a command before the `;`

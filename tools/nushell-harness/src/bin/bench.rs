@@ -9,12 +9,18 @@
 //! iteration; its cost includes declaration resolution and type checking,
 //! which `nu-winnow-parser` does not do, so the comparison measures the whole
 //! "source to AST" step each engine performs rather than lexing alone.
+//!
+//! With `--std` the standard library is registered so that `use std/log`
+//! resolves; `nu-parser` then parses the imported module sources inside the
+//! timed region, which is part of what the shell does but not a
+//! parser-to-parser comparison.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use nu_protocol::engine::{EngineState, StateWorkingSet};
 use nu_winnow_parser::{ParseConfig, parse_lenient};
+use nushell_harness::engine;
 
 fn collect(path: &Path, out: &mut Vec<PathBuf>) {
     if path.is_dir() {
@@ -26,20 +32,6 @@ fn collect(path: &Path, out: &mut Vec<PathBuf>) {
     } else if path.extension().is_some_and(|e| e == "nu") {
         out.push(path.to_path_buf());
     }
-}
-
-/// The engine state the `nu` binary parses with. With `std`, the standard
-/// library is registered so that `use std/log` resolves; note that
-/// `nu-parser` then parses the imported module sources inside the timed
-/// region, which is part of what the shell does but not a parser-to-parser
-/// comparison.
-fn engine(std: bool) -> EngineState {
-    let engine_state = nu_cmd_lang::create_default_context();
-    let mut engine_state = nu_command::add_shell_command_context(engine_state);
-    if std && let Err(e) = nu_std::load_standard_library(&mut engine_state) {
-        eprintln!("warning: could not load the standard library: {e}");
-    }
-    engine_state
 }
 
 fn time_nu_parser(engine_state: &EngineState, name: &str, src: &[u8], iters: usize) -> (Duration, usize) {

@@ -23,8 +23,11 @@
 //! * `nu_syntax_rejects`: nu-parser reports a syntax error and this parser
 //!   accepts (a bug here, or a rule still to port);
 //! * `nu_semantic_rejects`: nu-parser's first error is semantic and this
-//!   parser accepts (expected);
+//!   parser accepts (the checks a consumer adds: declarations, types, files);
 //! * `panics`: either parser panicked (always a bug).
+//!
+//! There is no list of tolerated differences: `--details` prints every row
+//! that is not `agree`, semantic ones included, with both messages.
 //!
 //! The exit status is 1 when `ours_rejects`, `nu_syntax_rejects` or
 //! `panics` is non-zero, so the run can gate a check-in.
@@ -36,6 +39,7 @@ use nu_protocol::ParseError;
 use nu_protocol::engine::{EngineState, StateWorkingSet};
 use nu_winnow_parser::lex::{LexOptions, TokenContents, lex};
 use nu_winnow_parser::{ParseConfig, parse_lenient};
+use nushell_harness::engine;
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -60,17 +64,6 @@ fn collect(path: &Path, out: &mut Vec<PathBuf>) {
     } else if path.extension().is_some_and(|e| e == "nu") {
         out.push(path.to_path_buf());
     }
-}
-
-fn engine(std: bool) -> EngineState {
-    let engine_state = nu_cmd_lang::create_default_context();
-    let engine_state = nu_command::add_shell_command_context(engine_state);
-    let mut engine_state = nu_cmd_extra::add_extra_command_context(engine_state);
-    engine_state.generate_nu_constant();
-    if std && let Err(e) = nu_std::load_standard_library(&mut engine_state) {
-        eprintln!("warning: could not load the standard library: {e}");
-    }
-    engine_state
 }
 
 /// The variant name of a `ParseError`, from its `Debug` form.
@@ -171,30 +164,6 @@ fn is_syntax_error(err: &ParseError) -> bool {
     )
 }
 
-/// Cases where nu-parser accepts and this parser rejects on purpose, keyed
-/// by the start of this parser's message. Each is a nu tolerance that a
-/// formatter should not copy, or a consequence of leaving command
-/// resolution to the consumer (arguments of a command nu does not know are
-/// external strings there, and values here).
-const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
-    ("expected `:` before the input/output types", "nu ignores extra items after a `def` body"),
-    (
-        "extra tokens after the end of the expression",
-        "nu ignores extra items after an `export-env` body or a quoted word",
-    ),
-    ("invalid int literal", "arguments of an unknown command are external strings in nu"),
-    ("invalid duration literal", "arguments of an unknown command are external strings in nu"),
-    ("invalid filesize literal", "arguments of an unknown command are external strings in nu"),
-    ("expected valid variable name", "nu accepts a bare `$` as a variable name"),
-    ("assignment requires a variable", "nu reads `=|` as a word"),
-    ("expected { (while parsing match)", "nu accepts `match {block} $value`"),
-    ("unclosed delimiter: expected `]`", "`[a-d]:1` is a glob for a glob-shaped positional in nu, an unclosed list here"),
-];
-
-fn known_difference(message: &str) -> Option<&'static str> {
-    KNOWN_DIFFERENCES.iter().find(|(prefix, _)| message.starts_with(prefix)).map(|(_, why)| *why)
-}
-
 enum Verdict {
     Accept,
     Reject(String),
@@ -233,7 +202,6 @@ struct Summary {
     ours_rejects: usize,
     nu_syntax_rejects: usize,
     nu_semantic_rejects: usize,
-    known: usize,
     panics: usize,
 }
 
@@ -317,12 +285,13 @@ fn compare(engine_state: &EngineState, config: &ParseConfig, unit: &Unit, summar
     let (class, report) = match (&nu, &ours) {
         (Verdict::Panic, _) | (_, Verdict::Panic) => (&mut summary.panics, Some("PANIC")),
         (Verdict::Accept, Verdict::Accept) | (Verdict::Reject(_), Verdict::Reject(_)) => (&mut summary.agree, None),
-        (Verdict::Accept, Verdict::Reject(m)) if known_difference(m).is_some() => (&mut summary.known, None),
         (Verdict::Accept, Verdict::Reject(_)) => (&mut summary.ours_rejects, Some("ours rejects, nu accepts")),
         (Verdict::Reject(_), Verdict::Accept) if syntax => {
             (&mut summary.nu_syntax_rejects, Some("nu rejects (syntax), ours accepts"))
         }
-        (Verdict::Reject(_), Verdict::Accept) => (&mut summary.nu_semantic_rejects, None),
+        (Verdict::Reject(_), Verdict::Accept) => {
+            (&mut summary.nu_semantic_rejects, Some("nu rejects (semantic), ours accepts"))
+        }
     };
     *class += 1;
     if let Some(label) = report
@@ -405,21 +374,21 @@ pub fn main() {
     if json {
         let fields = |s: &Summary| {
             format!(
-                "{{\"total\":{},\"agree\":{},\"ours_rejects\":{},\"nu_syntax_rejects\":{},\"nu_semantic_rejects\":{},\"known\":{},\"panics\":{}}}",
-                s.total, s.agree, s.ours_rejects, s.nu_syntax_rejects, s.nu_semantic_rejects, s.known, s.panics
+                "{{\"total\":{},\"agree\":{},\"ours_rejects\":{},\"nu_syntax_rejects\":{},\"nu_semantic_rejects\":{},\"panics\":{}}}",
+                s.total, s.agree, s.ours_rejects, s.nu_syntax_rejects, s.nu_semantic_rejects, s.panics
             )
         };
         println!("{{\"originals\":{},\"mutants\":{}}}", fields(&originals), fields(&mutated));
     } else {
         println!(
-            "{:<10} {:>8} {:>8} {:>13} {:>18} {:>20} {:>6} {:>7}",
-            "set", "total", "agree", "ours_rejects", "nu_syntax_rejects", "nu_semantic_rejects", "known", "panics"
+            "{:<10} {:>8} {:>8} {:>13} {:>18} {:>20} {:>7}",
+            "set", "total", "agree", "ours_rejects", "nu_syntax_rejects", "nu_semantic_rejects", "panics"
         );
         for (name, s) in rows {
             if s.total > 0 {
                 println!(
-                    "{name:<10} {:>8} {:>8} {:>13} {:>18} {:>20} {:>6} {:>7}",
-                    s.total, s.agree, s.ours_rejects, s.nu_syntax_rejects, s.nu_semantic_rejects, s.known, s.panics
+                    "{name:<10} {:>8} {:>8} {:>13} {:>18} {:>20} {:>7}",
+                    s.total, s.agree, s.ours_rejects, s.nu_syntax_rejects, s.nu_semantic_rejects, s.panics
                 );
             }
         }

@@ -6,7 +6,8 @@ Block 0..38
         Param positional `y` 18..24 : int
       Body 27..36
         Pipeline 27..36
-          Call `a:` 27..36
+          ExternalCall 27..36
+            String Bare "a:" 27..29
             Record 30..36
               Pair
                 String Bare "a" 31..32

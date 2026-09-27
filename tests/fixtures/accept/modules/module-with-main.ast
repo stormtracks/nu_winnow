@@ -21,4 +21,5 @@ Block 0..90
     Use 82..87
       String Bare "m" 86..87
   Pipeline 88..89
-    Call `m` 88..89
+    ExternalCall 88..89
+      String Bare "m" 88..89

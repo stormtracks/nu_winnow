@@ -3,9 +3,7 @@
 //! The inputs come from `crates/nu-parser/tests/test_lex.rs`,
 //! `test_parser.rs`, `test_parser_unicode_escapes.rs` and the language tests
 //! in `tests/repl/` of the Nushell repository; each table asserts the value
-//! or shape nu-parser produces for the same text. Where nu's tree differs
-//! by design (unknown heads are `Call`, not `ExternalCall`), the comment on
-//! the table says so.
+//! or shape nu-parser produces for the same text.
 //!
 //! `tests/fixtures/` covers accept/reject verdicts and pins whole trees; this
 //! file pins individual values, spans and token streams.
@@ -154,13 +152,15 @@ fn number_like_strings(#[case] src: &str, #[case] expected: &str) {
     assert_eq!(value, expected);
 }
 
-/// `./a/b` is an external command in nu (`Expression::GlobPattern` head); here it is
-/// a `Call` whose head is the word, since externals are a signature question.
+/// `./a/b` is no known command, so it is an external command, as in nu.
 #[test]
-fn relative_path_is_a_command_head() {
+fn relative_path_is_an_external_command() {
     let ast = ok("./a/b");
     match &last_expr(&ast).expr {
-        Expr::Call(c) => assert_eq!(c.head.name, "./a/b"),
+        Expr::ExternalCall(c) => {
+            assert_eq!(c.caret, None);
+            assert_eq!(string_value(&c.head).0, "./a/b");
+        }
         other => panic!("{other:?}"),
     }
 }
@@ -297,14 +297,13 @@ fn interpolation_parts(#[case] src: &str, #[case] quote: Quote, #[case] parts: &
     assert_eq!(shape, parts, "{src}");
 }
 
-/// nu makes `~/.foo/(1)` at the head of a pipeline an external call with an
-/// interpolated name; here an unknown head is a `Call` whose name is the
-/// word, and the consumer decides (the bridge re-parses it as an external).
+/// `~/.foo/(1)` at the head of a pipeline is an external call with an
+/// interpolated name, as in nu.
 #[test]
-fn interpolated_bare_word_at_pipeline_head_is_a_call() {
+fn interpolated_bare_word_at_pipeline_head_is_an_external_call() {
     let ast = ok("~/.foo/(1)");
     match &last_expr(&ast).expr {
-        Expr::Call(c) => assert_eq!(c.head.name, "~/.foo/(1)"),
+        Expr::ExternalCall(c) => assert!(matches!(c.head.expr, Expr::StringInterpolation(_)), "{:?}", c.head),
         other => panic!("{other:?}"),
     }
 }

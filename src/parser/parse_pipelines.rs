@@ -5,7 +5,7 @@ use crate::ast::{
 };
 use crate::error::{Diagnostic, ErrorKind};
 use crate::input::{ParseResult, cut, into_diagnostic};
-use crate::lex::{RedirectionSource, TokenContents};
+use crate::lex::{RedirectionSource, Token, TokenContents, assignment_operator};
 use crate::span::Span;
 
 use super::WorkingSet;
@@ -41,9 +41,6 @@ pub fn parse_block<'a>(mut tokens: Tokens<'_, 'a>, span: Span) -> Block<'a> {
     let mut pipelines: Vec<Pipeline<'a>> = Vec::new();
     let mut pending: Vec<Comment> = Vec::new();
     let mut last = TokenContents::Eol;
-    // Set when a pipeline ended with a `|` that a blank line closed: nu's
-    // lexer then refuses a `;` before the next item.
-    let mut dangling_pipe: Option<Span> = None;
     while let Some(token) = tokens.peek_token() {
         match token.contents {
             TokenContents::Eol => {
@@ -54,11 +51,6 @@ pub fn parse_block<'a>(mut tokens: Tokens<'_, 'a>, span: Span) -> Block<'a> {
                 last = TokenContents::Eol;
             }
             TokenContents::Semicolon => {
-                if let Some(pipe) = dangling_pipe {
-                    working_set.error(Diagnostic::new(ErrorKind::ExtraTokens, token.span).with_help(format!(
-                        "the pipeline is still open after the `|` at {pipe}; add a command or remove the `;`"
-                    )));
-                }
                 if !matches!(last, TokenContents::Eol | TokenContents::Semicolon)
                     && let Some(pipeline) = pipelines.last_mut()
                     && pipeline.terminator.is_none()
@@ -80,14 +72,10 @@ pub fn parse_block<'a>(mut tokens: Tokens<'_, 'a>, span: Span) -> Block<'a> {
                 last = TokenContents::Comment;
             }
             _ => {
-                dangling_pipe = None;
                 let start = tokens.position();
                 let start_span = token.span;
                 match parse_pipeline(&mut tokens, std::mem::take(&mut pending)) {
-                    Ok((pipeline, dangling)) => {
-                        dangling_pipe = dangling;
-                        pipelines.extend(pipeline);
-                    }
+                    Ok(pipeline) => pipelines.extend(pipeline),
                     Err(error) => {
                         working_set.error(into_diagnostic(error));
                         tokens.reset_to(start);
@@ -102,29 +90,26 @@ pub fn parse_block<'a>(mut tokens: Tokens<'_, 'a>, span: Span) -> Block<'a> {
     Block { span, pipelines }
 }
 
-/// One pipeline (nu's `parse_pipeline`): commands separated by `|`. Also
-/// returns the span of a trailing `|` that a blank line closed, if any. `None`
-/// when there was no command at all (a lone `|` before a blank line).
+/// One pipeline (nu's `parse_pipeline`): commands separated by `|`. `None`
+/// when there was no command at all (a lone `|` before a blank line). A `;`
+/// right after a `|` never gets here: the lexer refuses it, as nu's does.
 fn parse_pipeline<'a>(
     tokens: &mut Tokens<'_, 'a>,
     leading_comments: Vec<Comment>,
-) -> ParseResult<(Option<Pipeline<'a>>, Option<Span>)> {
+) -> ParseResult<Option<Pipeline<'a>>> {
     let working_set = tokens.working_set;
     // The lite parse first: collect the commands, then parse them, because a
     // command is parsed differently when it is one element of a longer pipeline.
     let mut lite_commands: Vec<(Option<Span>, LiteCommand)> = Vec::new();
     let mut trailing_comments = Vec::new();
     let mut pipe: Option<Span> = None;
-    let mut dangling = None;
     'commands: loop {
         // A pipeline may start with `|` (`( | str join)`) and `a | | b` is
         // `a | b`: the empty commands are dropped.
         while let Some(token) = tokens.peek_token().filter(|token| token.contents == TokenContents::Pipe) {
-            let span = token.span;
+            pipe = Some(token.span);
             tokens.next_token();
-            pipe = Some(span);
-            if let AfterPipe::Dangling = after_pipe(tokens, span, &mut trailing_comments)? {
-                dangling = pipe.take();
+            if let AfterPipe::Dangling = after_pipe(tokens, &mut trailing_comments)? {
                 break 'commands;
             }
         }
@@ -139,17 +124,16 @@ fn parse_pipeline<'a>(
         trailing_comments.extend(lite_command.comments.iter().copied());
         let pipe_after = lite_command.pipe_after;
         lite_commands.push((pipe.take(), lite_command));
-        if let Some(span) = pipe_after {
-            pipe = Some(span);
-            if let AfterPipe::Dangling = after_pipe(tokens, span, &mut trailing_comments)? {
-                dangling = pipe.take();
+        if pipe_after.is_some() {
+            pipe = pipe_after;
+            if let AfterPipe::Dangling = after_pipe(tokens, &mut trailing_comments)? {
                 break;
             }
         }
     }
     if lite_commands.is_empty() {
         // Only pipes (`|` and a blank line): nu drops the empty command.
-        return Ok((None, dangling));
+        return Ok(None);
     }
     let single = lite_commands.len() == 1;
     let mut elements: Vec<PipelineElement<'a>> = Vec::with_capacity(lite_commands.len());
@@ -167,7 +151,7 @@ fn parse_pipeline<'a>(
         }
         _ => None,
     };
-    Ok((Some(Pipeline { span, elements, leading_comments, trailing_comments, terminator }), dangling))
+    Ok(Some(Pipeline { span, elements, leading_comments, trailing_comments, terminator }))
 }
 
 /// One command of a pipeline, as collected by the lite parse (nu's
@@ -181,6 +165,24 @@ fn parse_pipeline_element<'a>(
     let position = if in_pipeline { Position::Element } else { Position::Statement };
     let expr = match lite_command.attributes.as_slice() {
         [] => parse_expression(lite_command.tokens(working_set), position)?,
+        // nu parses an element of a longer pipeline from all its items, the
+        // attribute lines included, so the first attribute item is the head:
+        // `@e\nx | y` calls an unknown `@e`, and `@e; def f [] {} | y` is no
+        // statement in a pipeline.
+        attribute_lines if in_pipeline => {
+            // nu finds an assignment by the text of the items, so an `=` of an
+            // attribute line counts (`@a x = y\nb | c` assigns to `@a x`).
+            let items: Vec<Token> = attribute_lines
+                .iter()
+                .flatten()
+                .map(|token| match assignment_operator(working_set.get_span_contents(token.span)) {
+                    Some(operator) => Token { contents: TokenContents::AssignmentOperator(operator), span: token.span },
+                    None => *token,
+                })
+                .chain(lite_command.parts.iter().copied())
+                .collect();
+            parse_expression(Tokens::new(working_set, &items, lite_command.end), position)?
+        }
         attribute_lines => {
             let attributes = attribute_lines
                 .iter()

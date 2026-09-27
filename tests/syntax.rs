@@ -708,7 +708,7 @@ fn definitions_cannot_use_parser_keywords() {
 fn external_calls() {
     let ast = ok("^git commit -m 'msg' --all $file (pwd)/x ...$rest [a b] {c: 1}");
     let e = kind!(expr(&ast), Expr::ExternalCall(e) => e);
-    assert_eq!(text(&ast, e.caret), "^");
+    assert_eq!(text(&ast, e.caret.expect("a caret")), "^");
     assert_eq!(string(&e.head), ("git", Quote::Bare));
     assert_eq!(e.arguments.len(), 9);
     let regular: Vec<&Expression<'_>> = e
@@ -748,7 +748,9 @@ fn env_shorthand() {
     assert_eq!(string(&e.vars[0].value).0, "bar");
     kind!(e.vars[1].value, Expr::Var(_));
     assert_eq!(string(&e.vars[2].value).0, "");
-    assert_eq!(call(&e.expr).head.name, "cmd");
+    // `cmd` is no known command: an external call, as in nu.
+    let external = kind!(e.expr, Expr::ExternalCall(c) => c);
+    assert_eq!(string(&external.head), ("cmd", Quote::Bare));
     let ast = ok("echo a=b");
     kind!(expr(&ast), Expr::Call(_));
     assert!(parse("FOO=bar").is_err());

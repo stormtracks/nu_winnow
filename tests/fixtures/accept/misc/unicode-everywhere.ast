@@ -11,7 +11,8 @@ Block 0..120
             Text "héllo " 53..60
             Subexpression 60..66 61..65
               Pipeline 61..65
-                Call `🧼` 61..65
+                ExternalCall 61..65
+                  String Bare "🧼" 61..65
   Pipeline 70..98
     let 日本 70..98
       Value 83..98

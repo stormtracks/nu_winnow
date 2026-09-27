@@ -4,7 +4,8 @@ Block 0..21
       Signature 6..8
       Body 10..19
         Pipeline 10..19
-          Call `a:` 10..19
+          ExternalCall 10..19
+            String Bare "a:" 10..12
             Record 13..19
               Pair
                 String Bare "a" 14..15

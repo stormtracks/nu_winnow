@@ -154,12 +154,14 @@ fn parse_generic_shape<'a>(working_set: &WorkingSet<'a>, span: Span) -> ParseRes
 }
 
 /// The comma-separated types of `list<int>` and `oneof<int, string>` (nu's
-/// `parse_type_params`).
+/// `parse_type_params`). Like nu, every other token is read as a type, so
+/// `list<int;>` and `list<int:>` have an unknown type.
 fn parse_type_params<'a>(working_set: &WorkingSet<'a>, span: Span) -> ParseResult<Vec<TypeAnnotation<'a>>> {
-    let tokens = lex(working_set.get_span_contents(span), span.start, LexOptions::IO_TYPES).map_err(cut)?;
+    let tokens = lex(working_set.get_span_contents(span), span.start, LexOptions::TYPE_PARAMS).map_err(cut)?;
     tokens
         .iter()
-        .filter(|token| token.contents == TokenContents::Item)
+        .filter(|token| token.contents != TokenContents::Eof)
+        .filter(|token| !working_set.get_span_contents(token.span).starts_with(','))
         .map(|token| parse_type(working_set, token.span))
         .collect()
 }
@@ -175,7 +177,7 @@ fn parse_type_params<'a>(working_set: &WorkingSet<'a>, span: Span) -> ParseResul
 /// the type after a `:` may be any token (`record<a:, b: int>` has the unknown
 /// type `,`), and a name without a type has the type `any`.
 fn parse_named_type_params<'a>(working_set: &WorkingSet<'a>, span: Span) -> ParseResult<Vec<TypeField<'a>>> {
-    let lexed = lex(working_set.get_span_contents(span), span.start, LexOptions::SIGNATURE).map_err(cut)?;
+    let lexed = lex(working_set.get_span_contents(span), span.start, LexOptions::TYPE_PARAMS).map_err(cut)?;
     let mut tokens = Tokens::from_lexed(working_set, &lexed);
     let fields: Vec<Option<TypeField<'a>>> =
         repeat_to_end(alt((keyword(",").value(None), named_type_param.map(Some)))).parse_next(&mut tokens)?;

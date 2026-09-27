@@ -1135,12 +1135,15 @@ impl Argument<'_> {
     }
 }
 
-/// `^command args`.
+/// `^command args`, or `command args` for a command the parser does not know
+/// (nu's `Expr::ExternalCall`).
 #[derive(Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct ExternalCall<'a> {
-    /// The span of the `^`.
-    pub caret: Span,
+    /// The span of the `^`; `None` for a bare head that is neither a
+    /// configured command nor defined in the file (`git log`), or that is an
+    /// alias of an external command.
+    pub caret: Option<Span>,
     /// The command: a string, interpolation, variable or subexpression.
     pub head: Box<Expression<'a>>,
     /// The arguments.
@@ -1499,8 +1502,12 @@ pub struct Else<'a> {
 pub struct If<'a> {
     /// The condition.
     pub condition: Box<Expression<'a>>,
-    /// The then block.
+    /// The then block (empty when `then_value` is set).
     pub then_block: Block<'a>,
+    /// A variable or subexpression in place of the block (`if $c $env.f`):
+    /// nu-parser accepts one where it wants a block and type-checks it as a
+    /// block.
+    pub then_value: Option<Box<Expression<'a>>>,
     /// The else branch.
     pub else_branch: Option<Else<'a>>,
 }
@@ -1581,8 +1588,12 @@ pub struct For<'a> {
     pub in_keyword: Span,
     /// What to iterate.
     pub iterable: Box<Expression<'a>>,
-    /// The body.
+    /// The body (empty when `body_value` is set).
     pub body: Block<'a>,
+    /// A variable or subexpression in place of the block (`if $c $env.f`):
+    /// nu-parser accepts one where it wants a block and type-checks it as a
+    /// block.
+    pub body_value: Option<Box<Expression<'a>>>,
 }
 
 /// `while`.
@@ -1591,16 +1602,24 @@ pub struct For<'a> {
 pub struct While<'a> {
     /// The condition.
     pub condition: Box<Expression<'a>>,
-    /// The body.
+    /// The body (empty when `body_value` is set).
     pub body: Block<'a>,
+    /// A variable or subexpression in place of the block (`if $c $env.f`):
+    /// nu-parser accepts one where it wants a block and type-checks it as a
+    /// block.
+    pub body_value: Option<Box<Expression<'a>>>,
 }
 
 /// `loop`.
 #[derive(Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct Loop<'a> {
-    /// The body.
+    /// The body (empty when `body_value` is set).
     pub body: Block<'a>,
+    /// A variable or subexpression in place of the block (`if $c $env.f`):
+    /// nu-parser accepts one where it wants a block and type-checks it as a
+    /// block.
+    pub body_value: Option<Box<Expression<'a>>>,
 }
 
 /// `return`.
@@ -1637,8 +1656,12 @@ pub struct Handler<'a> {
 #[derive(Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct Try<'a> {
-    /// The body.
+    /// The body (empty when `body_value` is set).
     pub body: Block<'a>,
+    /// A variable or subexpression in place of the block (`if $c $env.f`):
+    /// nu-parser accepts one where it wants a block and type-checks it as a
+    /// block.
+    pub body_value: Option<Box<Expression<'a>>>,
     /// The handlers in source order (at most two, in any order; Nushell
     /// accepts `catch` or `finally` for either slot).
     pub handlers: Vec<Handler<'a>>,

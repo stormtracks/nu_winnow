@@ -35,9 +35,11 @@ span; with no file it reads standard input.
 | `--quiet`, `-q` | With `--check`, print only the summary line |
 
 The environment variable `NU_WINNOW_COMMANDS=path` names a file with one
-command name per line; those names are added to the built-in command table so
-that, for example, standard-library commands such as `assert equal` resolve as
-one multi-word head. `tools/scripts/std_commands.txt` is such a file.
+command name per line; those names are added to the command table as custom
+commands (`ParseConfig::add_commands`) so that, for example, standard-library
+commands such as `assert equal` resolve as one multi-word head and are calls
+rather than external commands. `tools/scripts/std_commands.txt` is such a
+file.
 
 Things to try:
 
@@ -123,7 +125,7 @@ several lines keeps one item per line, with items the author put on one line
 (`"--flag" value`) kept together. The options are the fields of
 `format::Options`; the config file uses the same names. The defaults were
 chosen to reproduce the expected output of nufmt's ground-truth fixtures
-(`tools/scripts/nufmt-fixtures.nu` measures this: 111 of 130 as of this
+(`tools/scripts/nufmt-fixtures.nu` measures this: 114 of 130 as of this
 writing, the rest being invalid inputs, line-length wrapping, or nufmt's own
 inconsistencies).
 
@@ -211,27 +213,30 @@ nu tools/scripts/verify.nu --save tools/scripts/verify-history.nuon
 | Rung | What it compares | Good means |
 | --- | --- | --- |
 | `cargo test --all-features` | unit, syntax, fixtures (with golden trees), language tables, command examples, corpus, traceability, nufmt | 0 failures |
+| `gen-builtin-commands.nu --check` | `src/builtin_commands.rs` vs the harness engine's commands | current |
 | `fixtures-compare.nu` | every fixture through ours, `nu-check` and nu-parser | 0 rows where `ours != expected` |
 | `differential` originals | nu-parser vs ours over fixtures, corpora, nu-std, the Nushell repository's `.nu` files, nu_scripts, 1,700 command examples, 1,000 book blocks | 0 `ours_rejects`, 0 `nu_syntax_rejects`, 0 panics |
-| `differential` mutants | the same inputs, each mutated 3 times | as few residual disagreements as possible, 0 panics |
+| `differential` mutants | the same inputs, each mutated 3 times | 0 `ours_rejects`, 0 `nu_syntax_rejects`, 0 panics |
 | `nucheck-compare.nu` | `nu-check` vs ours over nu_scripts and nu-std | 0 files nu accepts that we reject |
 | `flatcmp.nu` | nu's `ast --flatten` vs ours over nu-std | only the documented differences |
-| `nufmt-fixtures.nu` | the formatter vs the nushell/nufmt reference fixtures | 111 of 130 |
+| `nufmt-fixtures.nu` | the formatter vs the nushell/nufmt reference fixtures | 114 of 130 |
 
-Scoreboard on 2026-09-24 against the Nushell checkout `d7cb4e589` (main,
-harness built with the `[patch]` block) and `nu` 0.115.2
-(`tools/scripts/verify-history.nuon` keeps the record): 1,756 tests, 0
-failures; 1,280 fixtures, 0 with `ours != expected` (17 where `nu-check`
-rejects for semantic reasons); differential originals 5,776 compared, 5
-`ours_rejects`, 0 `nu_syntax_rejects`, 286 semantic, 0 panics; mutants
-17,328 compared, 13 `ours_rejects`, 2 `nu_syntax_rejects`, 8 known, 0
-panics; nucheck-compare 1,599 files, 0 accepted by nu and rejected here;
-flatcmp 125 differing runs over nu-std (the documented signature-dependent
-ones); nufmt reference fixtures 111 of 130. Every `ours_rejects` row is a
-`plugin use` snippet (the harness registers no plugin commands, so they are
-external calls for it; `fixtures-compare` with the real `nu` agrees with
-this parser), and the two `nu_syntax_rejects` mutants need a module
-(`use eggs foo foo`) or a signature (`skip 0x[01]`).
+Scoreboard on 2026-09-26 against the Nushell checkout `7de074cfe` (main; the
+harness is locked to the same commit) and `nu` 0.115.2
+(`tools/scripts/verify-history.nuon` keeps the record): 1,862 tests, 0
+failures; the command table matches the harness engine; 1,384 fixtures, 0
+with `ours != expected` (17 where `nu-check` rejects for semantic reasons);
+differential originals 5,880 compared, 0 `ours_rejects`, 0
+`nu_syntax_rejects`, 294 semantic, 0 panics; mutants (seed 1) 17,640
+compared, 0 `ours_rejects`, 0 `nu_syntax_rejects`, 2,187 semantic, 0
+panics; nucheck-compare 1,599 files, 0 accepted by nu and rejected here (73
+the other way, all semantic); flatcmp 125 differing runs over nu-std (the
+documented signature-dependent ones); nufmt reference fixtures 114 of 130.
+The differential keeps no list of tolerated differences. Seeds 2 to 10 of
+the mutants still find a few rows each, all of the classes in
+`grammar/grammar.md` section 9.4 (a module's contents, a built-in command's
+signature, a variable's existence, a file) or the one open row of 9.2
+(`alias i = if if x y`).
 
 When a number moves, `differential --details` and `fixtures-compare
 --details` say which input and why. When Nushell adds syntax, the
@@ -247,9 +252,11 @@ cargo run --release --bin differential -- [--details] [--json] [--mutants N] [--
 
 `extract-corpus.nu` regenerates `tests/corpus/snippets/*.json` from the
 checkouts (default `~/src/nushell` and `~/src/nushell.github.io`).
-`differential` parses every file and snippet with both parsers in process;
-its summary columns are explained in chapter 09, and `--details` prints each
-disagreement with nu-parser's and this parser's message. It exits 1 when
+`differential` parses every file and snippet with both parsers in process,
+nu-parser in the `nu` binary's engine (`tools/nushell-harness/src/lib.rs`);
+its summary columns are explained in chapter 09, and `--details` prints every
+disagreement, semantic ones included, with nu-parser's and this parser's
+message. There is no list of tolerated differences. It exits 1 when
 `ours_rejects`, `nu_syntax_rejects` or `panics` is non-zero.
 
 ```nushell
@@ -443,9 +450,26 @@ nu tools/scripts/flatcmp.nu --commands tools/scripts/std_commands.txt tests/corp
 nu -c 'nu tools/scripts/flatcmp.nu --commands tools/scripts/std_commands.txt ...(glob ~/src/nushell/crates/nu-std/**/*.nu)'
 ```
 
-The residual differences are the documented signature-dependent ones: `get
-a.0` is a cell path only because `get` declares that shape, attribute lines
-are opaque to nu's flatten, and `$.` is a cell-path literal here.
+The residual differences are the documented ones: `get a.0` is a cell path
+only because `get` declares that shape, attribute lines are opaque to nu's
+flatten, `$.` is a cell-path literal here, and the `=>` of a last match arm
+whose body is an empty `{ }` inside a `def` is an operator here while nu's
+flatten, which emits nothing for the empty block, leaves it to the enclosing
+closure. Without `--commands`, a standard-library command is an external
+call here (as in nu before `use`), so pass the list.
+
+### `gen-builtin-commands.nu`
+
+```nushell
+nu tools/scripts/gen-builtin-commands.nu            # rewrite src/builtin_commands.rs
+nu tools/scripts/gen-builtin-commands.nu --check    # exit 1 when it is stale
+```
+
+Regenerates `src/builtin_commands.rs`, the commands `ParseConfig::new()`
+knows, with their `CommandType`, from the harness's `builtin-commands`
+binary: the engine of the `nu` binary with the standard library's prelude
+and no plugins, at the Nushell commit the harness is built from. Run it after
+moving the harness to a new commit; `verify.nu` checks that it is current.
 
 ### `gen-std-commands.nu`
 
@@ -460,7 +484,7 @@ that the other scripts and `NU_WINNOW_COMMANDS` use.
 
 | Feature | Default | Effect |
 | --- | --- | --- |
-| `builtin-commands` | on | Embed Nushell's built-in command names so multi-word heads such as `str trim` resolve. Without it `ParseConfig::new()` knows no commands and every head is one word. |
+| `builtin-commands` | on | Embed the commands of a fresh `nu` (`src/builtin_commands.rs`) so multi-word heads such as `str trim` resolve, a head that is no command is an external call, and `%name` is checked. Without it `ParseConfig::new()` knows no commands and every head is a one-word call. |
 | `serde` | off | Derive `Serialize` for the AST and diagnostics; enables `parse --json` |
 
 ```nushell

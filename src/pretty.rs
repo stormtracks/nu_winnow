@@ -70,6 +70,18 @@ impl<'a> Printer<'a> {
         });
     }
 
+    /// A keyword's block, or the variable or subexpression standing in for
+    /// it, printed under `{label}Value`.
+    fn block_or_value(&mut self, label: &str, block: &Block<'a>, value: Option<&Expression<'a>>) {
+        match value {
+            Some(value) => {
+                self.line(format_args!("{label}Value"));
+                self.nested(|printer| printer.expr(value));
+            }
+            None => self.block(label, block),
+        }
+    }
+
     fn pipeline(&mut self, pipeline: &Pipeline<'a>) {
         let comments = pipeline.leading_comments.len() + pipeline.trailing_comments.len();
         let mut extra = String::new();
@@ -479,7 +491,7 @@ impl<'a> Printer<'a> {
                 self.nested(|printer| {
                     printer.line(format_args!("Condition"));
                     printer.nested(|printer| printer.expr(&if_expression.condition));
-                    printer.block("Then", &if_expression.then_block);
+                    printer.block_or_value("Then", &if_expression.then_block, if_expression.then_value.as_deref());
                     if let Some(else_branch) = &if_expression.else_branch {
                         printer.line(format_args!("Else {}", else_branch.keyword));
                         printer.nested(|printer| printer.expr(&else_branch.body));
@@ -516,17 +528,23 @@ impl<'a> Printer<'a> {
                 self.line(format_args!("For ${}{ty} {span}", for_loop.var.item));
                 self.nested(|printer| {
                     printer.expr(&for_loop.iterable);
-                    printer.block("Body", &for_loop.body);
+                    printer.block_or_value("Body", &for_loop.body, for_loop.body_value.as_deref());
                 });
             }
             Expr::While(while_loop) => {
                 self.line(format_args!("While {span}"));
                 self.nested(|printer| {
                     printer.expr(&while_loop.condition);
-                    printer.block("Body", &while_loop.body);
+                    printer.block_or_value("Body", &while_loop.body, while_loop.body_value.as_deref());
                 });
             }
-            Expr::Loop(loop_expression) => self.block(&format!("Loop {span}"), &loop_expression.body),
+            Expr::Loop(loop_expression) => match &loop_expression.body_value {
+                Some(value) => {
+                    self.line(format_args!("Loop {span}"));
+                    self.nested(|printer| printer.block_or_value("Body", &loop_expression.body, Some(value)));
+                }
+                None => self.block(&format!("Loop {span}"), &loop_expression.body),
+            },
             Expr::Break => self.line(format_args!("Break {span}")),
             Expr::Continue => self.line(format_args!("Continue {span}")),
             Expr::Return(return_expression) => {
@@ -538,7 +556,7 @@ impl<'a> Printer<'a> {
             Expr::Try(try_expression) => {
                 self.line(format_args!("Try {span}"));
                 self.nested(|printer| {
-                    printer.block("Body", &try_expression.body);
+                    printer.block_or_value("Body", &try_expression.body, try_expression.body_value.as_deref());
                     for handler in &try_expression.handlers {
                         printer.line(format_args!("{:?} {}", handler.kind, handler.keyword));
                         printer.nested(|printer| printer.expr(&handler.body));

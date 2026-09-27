@@ -7,7 +7,8 @@ Block 0..34
         Pipeline 11..14
           String Single "a" 11..14
       Else 17..21
-        Call `foo` 22..33
+        ExternalCall 22..33
+          String Bare "foo" 22..25
           Closure 26..33
             Body 28..32
               Pipeline 28..31

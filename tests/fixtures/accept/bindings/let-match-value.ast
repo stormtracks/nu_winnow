@@ -8,7 +8,9 @@ Block 0..35
             Arm 18..24
               Pattern value 18..19
                 Int 1 18..19
-              Call `a` 23..24
+              ExternalCall 23..24
+                String Bare "a" 23..24
             Arm 26..32
               Pattern _ 26..27
-              Call `b` 31..32
+              ExternalCall 31..32
+                String Bare "b" 31..32

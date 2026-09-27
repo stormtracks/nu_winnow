@@ -22,8 +22,40 @@ use super::{CommandSet, ParseConfig};
 pub enum DeclKind {
     /// Declared with `def`, `extern` or `alias` in an enclosing block.
     Declared,
+    /// A `def --wrapped` whose rest parameter has no type (`def --wrapped f
+    /// [...rest] {}`), or an alias of one: nu gives that parameter the
+    /// `external_arg` shape, so its arguments parse as an external command's.
+    Wrapped,
+    /// An `alias` whose target is an external command (`alias g = git`): nu
+    /// parses a call to it as an external call, with external arguments.
+    ExternalAlias,
     /// One of the configured (built-in) commands of [`ParseConfig`].
     Builtin,
+}
+
+/// The commands declared in one block, closure or module body.
+#[derive(Debug, Default)]
+struct Scope {
+    commands: CommandSet,
+    /// The names in `commands` whose calls parse differently: aliases of
+    /// external commands and wrapped commands. Few, so a list.
+    kinds: Vec<(Box<str>, DeclKind)>,
+}
+
+impl Scope {
+    /// Declare `name`, and record how calls to it parse.
+    fn declare(&mut self, name: &str, kind: DeclKind) {
+        self.commands.insert(name);
+        self.kinds.retain(|(declared, _)| **declared != *name);
+        if matches!(kind, DeclKind::ExternalAlias | DeclKind::Wrapped) {
+            self.kinds.push((Box::from(name), kind));
+        }
+    }
+
+    /// How calls to `name`, declared in this scope, parse.
+    fn kind(&self, name: &str) -> DeclKind {
+        self.kinds.iter().find(|(declared, _)| **declared == *name).map_or(DeclKind::Declared, |&(_, kind)| kind)
+    }
 }
 
 /// The source text, the known command names, and what one parse collects.
@@ -38,7 +70,7 @@ pub struct WorkingSet<'a> {
     parse_errors: RefCell<Vec<Diagnostic>>,
     /// Command names declared with `def`/`extern`/`alias` in enclosing blocks,
     /// innermost scope last.
-    scopes: RefCell<Vec<CommandSet>>,
+    scopes: RefCell<Vec<Scope>>,
 }
 
 /// What a finished parse collected besides the tree.
@@ -57,7 +89,7 @@ impl<'a> WorkingSet<'a> {
             comments: RefCell::new(Vec::new()),
             ignored: RefCell::new(Vec::new()),
             parse_errors: RefCell::new(Vec::new()),
-            scopes: RefCell::new(vec![CommandSet::default()]),
+            scopes: RefCell::new(vec![Scope::default()]),
         }
     }
 
@@ -97,26 +129,28 @@ impl<'a> WorkingSet<'a> {
     }
 
     /// Where `name` is known from, if it is a command: a declaration in an
-    /// enclosing block shadows a built-in command of the same name.
+    /// enclosing block shadows a built-in command of the same name, and the
+    /// innermost declaration wins.
+    #[inline]
     pub fn find_decl(&self, name: &str) -> Option<DeclKind> {
-        if self.is_declared(name) {
-            Some(DeclKind::Declared)
-        } else if self.config.is_known(name) {
-            Some(DeclKind::Builtin)
-        } else {
-            None
+        let scopes = self.scopes.borrow();
+        if let Some(scope) = scopes.iter().rev().find(|scope| scope.commands.names.contains(name)) {
+            return Some(scope.kind(name));
         }
+        self.config.is_known(name).then_some(DeclKind::Builtin)
     }
 
     /// Whether `name` was declared with `def`, `extern` or `alias` in an
     /// enclosing block (and so shadows a built-in command of that name).
+    #[inline]
     pub fn is_declared(&self, name: &str) -> bool {
-        self.scopes.borrow().iter().any(|scope| scope.names.contains(name))
+        self.scopes.borrow().iter().any(|scope| scope.commands.names.contains(name))
     }
 
     /// Whether `word` is the first word of some known multi-word command.
+    #[inline]
     pub fn is_decl_name_prefix(&self, word: &str) -> bool {
-        self.config.is_prefix(word) || self.scopes.borrow().iter().any(|scope| scope.prefixes.contains(word))
+        self.config.is_prefix(word) || self.scopes.borrow().iter().any(|scope| scope.commands.prefixes.contains(word))
     }
 
     /// Whether a table of built-in commands is configured. Rules that need to
@@ -126,25 +160,39 @@ impl<'a> WorkingSet<'a> {
     }
 
     /// Whether `name` is one of the configured built-in commands, whatever
-    /// the file declares.
+    /// the file declares (what `%name` may call).
     pub fn is_builtin_decl(&self, name: &str) -> bool {
-        self.config.is_known(name)
+        self.config.is_builtin(name)
     }
 
     /// Declare a command name in the innermost scope before its block is
-    /// parsed, so calls to it resolve (nu's `add_predecl`).
-    pub fn add_predecl(&self, name: &str) {
+    /// parsed, so calls to it resolve (nu's `add_predecl`); `kind` is
+    /// [`DeclKind::Wrapped`] or [`DeclKind::Declared`].
+    pub fn add_predecl(&self, name: &str, kind: DeclKind) {
         if let Some(scope) = self.scopes.borrow_mut().last_mut() {
-            scope.insert(name);
+            scope.declare(name, kind);
+        }
+    }
+
+    /// Declare an alias in the innermost scope once its statement is parsed
+    /// (nu adds an alias then, and never predeclares one). `kind` says how a
+    /// call to it parses: [`DeclKind::ExternalAlias`] when its target is an
+    /// external call, [`DeclKind::Wrapped`] when it is a call to a wrapped
+    /// command, else [`DeclKind::Declared`].
+    pub fn add_alias(&self, name: &str, kind: DeclKind) {
+        if let Some(scope) = self.scopes.borrow_mut().last_mut() {
+            scope.declare(name, kind);
         }
     }
 
     /// Enter a declaration scope (a block, closure or module body).
+    #[inline]
     pub fn enter_scope(&self) {
-        self.scopes.borrow_mut().push(CommandSet::default());
+        self.scopes.borrow_mut().push(Scope::default());
     }
 
     /// Leave the innermost declaration scope.
+    #[inline]
     pub fn exit_scope(&self) {
         self.scopes.borrow_mut().pop();
     }

@@ -39,8 +39,8 @@ a comment when it is surprising.
 hold one snippet each: every literal spelling, every statement form, every
 layout (multi-line, leading pipes, comments in every position, CRLF, tabs,
 Unicode) and every error the parser reports, about 1,270 files organised by
-grammar area, including one for every difference from nu-parser that
-`grammar/grammar.md` (section 9) ever recorded. Many are lifted from Nushell's own `crates/nu-parser/tests`
+grammar area, including one for every difference from nu-parser that was
+found and closed (`grammar/grammar.md` section 9 counts them). Many are lifted from Nushell's own `crates/nu-parser/tests`
 and `tests/repl` suites. `rstest`'s `#[files]` makes each file a test:
 
 * an `accept` fixture must parse with no diagnostics, with nested spans on
@@ -61,9 +61,9 @@ float values, filesize/duration decoding, binary bytes, string escapes and
 their error messages, interpolation parts, external-call heads and argument
 kinds, `%` sigil calls, cell-path members, every range form, operator
 precedence (as fully parenthesised text), redirections inside `let`, comment
-counts around pipes, lexer token spans and delimiter errors. Where nu's tree
-differs by design (an unknown head is a `Call`, a backtick word is unquoted
-in an external call) the table says so.
+counts around pipes, lexer token spans and delimiter errors. Where nu's own
+tree is surprising (a backtick word is unquoted in an external call) the
+table says so.
 
 ## `tests/examples.rs`: every built-in command's examples
 
@@ -104,26 +104,29 @@ parses but whose spans are wrong will format into something different.
 `differential` links nu-parser from the checkout and this crate into one
 binary and parses the same text with both: every fixture, corpus file,
 `nu-std` module, the Nushell repository's own `.nu` test files, `nu_scripts`,
-the command examples and the book. nu-parser's errors are classified as
-syntactic (delimiters, keywords, literals, operators: this parser must agree)
-or semantic (declarations, signatures, types, files: it cannot), and the
-summary counts `ours_rejects`, `nu_syntax_rejects`, `nu_semantic_rejects`,
-`known` (the documented tolerances of nu this parser does not copy) and
-`panics`. With `--mutants N` every input is also mutated N times (a token
+the command examples and the book. nu-parser runs in the `nu` binary's
+engine (`tools/nushell-harness/src/lib.rs` mirrors nushell's
+`command_context.rs`, with the same default features and the standard
+library), and `src/builtin_commands.rs` is generated from that engine, so
+both parsers know exactly the same commands. nu-parser's errors are
+classified as syntactic (delimiters, keywords, literals, operators: this
+parser must agree) or semantic (declarations, signatures, types, files: it
+cannot), and the summary counts `ours_rejects`, `nu_syntax_rejects`,
+`nu_semantic_rejects` and `panics`. There is no list of tolerated
+differences: every disagreement is counted and printed. With `--mutants N` every input is also mutated N times (a token
 deleted, duplicated or swapped, a delimiter inserted, a character dropped,
 the text truncated) and both parsers must still agree, which is how the
 edge rules of chapter 04 were found. `--details` prints each disagreement
-with both messages. The exit status gates a check-in. The harness's engine
-state has no plugin commands, so `plugin use` snippets are external calls
-for it and appear as `ours_rejects`: an artifact, not a disagreement
-(`fixtures-compare` with the real `nu` is the referee there). When GitHub's
+with both messages, semantic rows included. The exit status gates a
+check-in. When GitHub's
 `main` is behind the local checkout, uncomment the `[patch]` block in
 `tools/nushell-harness/Cargo.toml` to build against the checkout.
 
 ## The verification ladder (`tools/scripts/verify.nu`)
 
 One command runs every rung above and prints a scoreboard: `cargo test`,
-`fixtures-compare`, `differential` (with mutants), `nucheck-compare` over
+the command table (`gen-builtin-commands.nu --check`), `fixtures-compare`,
+`differential` (with mutants), `nucheck-compare` over
 `nu_scripts` and `nu-std`, `flatcmp` over `nu-std` and `nufmt-fixtures`.
 `--save FILE` appends the scoreboard with the date and the Nushell commit to
 a NUON history, so that "closer to 100%" is a number that can be watched
@@ -149,14 +152,17 @@ this writing.
   `--commands std_commands.txt` so standard-library commands resolve as
   multi-word names as they do inside nu. Residual differences are expected
   only where nu needs a signature (`get a.0` is a cell path), around
-  attribute lines and `$.`.
+  attribute lines, `$.`, and the `=>` before an empty `{ }` arm body inside a
+  `def` (nu's flatten emits nothing for the empty block).
+* `gen-builtin-commands.nu` regenerates `src/builtin_commands.rs` from the
+  harness engine; `--check` fails when it is stale.
 * `gen-std-commands.nu STD_DIR` regenerates `std_commands.txt`.
 * `gen-grammar.nu` regenerates `grammar/grammar.bnf` and `grammar/grammar.ebnf`
   from the fences of `grammar/grammar.md`; `--check` fails when they are
   stale. The BNF is the audit trail from nu-parser's source to this crate:
   every rule carries a `; nu:` line (file and function upstream) and a
-  `; here:` line (the function here, or `consumer`), and section 9 records
-  the differences that were found and closed.
+  `; here:` line (the function here, or `consumer`), and section 9 counts
+  the differences found and closed and describes the ones still open.
 
 Run these after any change to the lexer (`src/lex.rs`) or to how an item
 becomes a value (`parse_value` in `src/parser/parse_expressions.rs`,

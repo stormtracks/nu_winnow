@@ -15,13 +15,20 @@ description = "Benchmark, differential tests and an engine bridge, built against
 # uncomment the `[patch]` block at the end of this file.
 [dependencies]
 nu-winnow-parser = { path = "../.." }
-nu-parser = { git = "https://github.com/nushell/nushell", branch = "main" }
-nu-protocol = { git = "https://github.com/nushell/nushell", branch = "main" }
-nu-engine = { git = "https://github.com/nushell/nushell", branch = "main" }
-nu-cmd-lang = { git = "https://github.com/nushell/nushell", branch = "main" }
-nu-command = { git = "https://github.com/nushell/nushell", branch = "main" }
+# The same crates and default features (`plugin`, `sqlite`, `trash-support`)
+# as the `nu` binary, whose `src/command_context.rs` the harness engine
+# (`src/lib.rs`) mirrors.
+nu-parser = { git = "https://github.com/nushell/nushell", branch = "main", features = ["plugin"] }
+nu-protocol = { git = "https://github.com/nushell/nushell", branch = "main", features = ["plugin", "sqlite"] }
+nu-engine = { git = "https://github.com/nushell/nushell", branch = "main", features = ["plugin"] }
+nu-cmd-lang = { git = "https://github.com/nushell/nushell", branch = "main", features = ["plugin"] }
+nu-cmd-plugin = { git = "https://github.com/nushell/nushell", branch = "main" }
+nu-command = { git = "https://github.com/nushell/nushell", branch = "main", features = ["plugin", "sqlite", "trash-support"] }
 nu-cmd-extra = { git = "https://github.com/nushell/nushell", branch = "main" }
-nu-std = { git = "https://github.com/nushell/nushell", branch = "main" }
+nu-cli = { git = "https://github.com/nushell/nushell", branch = "main", features = ["plugin", "sqlite"] }
+nu-explore = { git = "https://github.com/nushell/nushell", branch = "main" }
+nu-tui = { git = "https://github.com/nushell/nushell", branch = "main" }
+nu-std = { git = "https://github.com/nushell/nushell", branch = "main", features = ["sqlite"] }
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -42,7 +49,16 @@ path = "src/bin/check.rs"
 name = "differential"
 path = "src/bin/differential.rs"
 
+[[bin]]
+name = "builtin-commands"
+path = "src/bin/builtin_commands.rs"
+
 [workspace]
+
+# nushell builds `nu-cli` against reedline's `main` branch (its own
+# `[patch.crates-io]`), which a git dependency does not inherit.
+[patch.crates-io]
+reedline = { git = "https://github.com/nushell/reedline", branch = "main" }
 
 # Uncomment to use a checkout next to this repository instead of GitHub.
 # [patch."https://github.com/nushell/nushell"]
@@ -50,6 +66,10 @@ path = "src/bin/differential.rs"
 # nu-protocol = { path = "../../../nushell/crates/nu-protocol" }
 # nu-engine = { path = "../../../nushell/crates/nu-engine" }
 # nu-cmd-lang = { path = "../../../nushell/crates/nu-cmd-lang" }
+# nu-cmd-plugin = { path = "../../../nushell/crates/nu-cmd-plugin" }
 # nu-command = { path = "../../../nushell/crates/nu-command" }
 # nu-cmd-extra = { path = "../../../nushell/crates/nu-cmd-extra" }
+# nu-cli = { path = "../../../nushell/crates/nu-cli" }
+# nu-explore = { path = "../../../nushell/crates/nu-explore" }
+# nu-tui = { path = "../../../nushell/crates/nu-tui" }
 # nu-std = { path = "../../../nushell/crates/nu-std" }

@@ -34,8 +34,10 @@ pub fn parse_const<'a>(tokens: Tokens<'_, 'a>) -> ParseResult<Expression<'a>> {
 }
 
 /// `let`, `mut` and `const`: `keyword name[: type] [= value...]`. Only `let`
-/// may leave the value out. nu takes these arguments by position, so a `--`
-/// is not an end-of-options marker here.
+/// may leave the value out. With an `=` nu takes these arguments by position,
+/// so a `--` is not an end-of-options marker (`let -- x = 1` is an error);
+/// without one it parses `let` as an ordinary call, where `--` ends the
+/// options (`let -- x` declares `x`).
 fn parse_binding<'a>(mut tokens: Tokens<'_, 'a>, kind: BindingKind) -> ParseResult<Expression<'a>> {
     let working_set = tokens.working_set;
     let statement = tokens;
@@ -48,6 +50,15 @@ fn parse_binding<'a>(mut tokens: Tokens<'_, 'a>, kind: BindingKind) -> ParseResu
     let keyword = tokens.expect_item(keyword_name)?;
     if let KeywordBoundary::Help = keyword_boundary_with(&mut tokens, keyword_name, &[], false)? {
         return parse_help_call(statement);
+    }
+    let has_equals = items.iter().any(|token| matches!(token.contents, TokenContents::AssignmentOperator(_)));
+    if matches!(kind, BindingKind::Let)
+        && !has_equals
+        && let Some(&marker) = tokens.peek_token()
+        && working_set.get_span_contents(marker.span) == "--"
+    {
+        working_set.add_ignored(marker.span);
+        tokens.next_token();
     }
     let name_token = match tokens.peek_token() {
         Some(token) if token.contents == TokenContents::Item => *token,

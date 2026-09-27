@@ -7,9 +7,11 @@ parses all of Nushell" can be audited rule by rule instead of asserted. Every
 rule was derived by reading nu-parser's source, not this crate's, and then
 annotated with where `nu-winnow-parser` implements it. Section 9 is the
 scoreboard of differences between the two parsers, each one verified by
-running both: as of 2026-09-24 it stands at **0 open** (9.1, 9.2 and 9.3 each
-show 0, with the closed rows kept as history and pinned as fixtures under
-`tests/fixtures/`; 9.4 lists the checks that are a consumer's by design).
+running both; it was re-verified on 2026-09-26 against commit `7de074cfe`
+(the differential harness's), whose line numbers the rules added then cite.
+It stands at **1 open** (9.2); the rows closed so far are counted there and
+pinned as fixtures under `tests/fixtures/`, and 9.4 lists the checks that are
+a consumer's by design.
 
 Nushell has no official grammar; the language is whatever `nu-parser` accepts.
 Much of nu-parser is *shape directed*: the syntax of an argument position is the
@@ -21,7 +23,7 @@ evaluation or files. `nu-winnow-parser` implements the first kind and leaves the
 second to its consumer, so a `; here: consumer` annotation is a design
 decision, not a gap. A `; here: none` annotation, or a rule marked
 `; DIFF n`, would be a real gap or disagreement, detailed in section 9; there
-are none at the time of writing.
+is one at the time of writing (`DIFF 1` on `<alias-target>`, see 9.2).
 
 ## 0. Notation and reading the annotations
 
@@ -402,7 +404,9 @@ this crate's `LexOptions` constants carry the same sets.
 ;   | ( "(" | "{" | "[" | "$" | "\"" | "'" | "-" ) ...
 ;   | <number> | <filesize> | <duration> | <datetime>
 ;   | <binary-literal>                 ; even one with invalid digits
-;   | <range>
+;   | <range>                          ; whose bounds parse: a `$` bound names a
+;                                      ; variable and a valid cell path on it, so
+;                                      ; `..$`, `..$x.c!!` are external commands
 ; the literal probes are the section 5 parsers run speculatively
 ; nu: parse_expressions.rs:38 is_math_expression_like
 ; here: src/parser/parse_expressions.rs::is_math_expression_like
@@ -497,6 +501,18 @@ Precedence (nu-protocol `ast/operator.rs:256`; higher binds tighter):
 ; here: src/parser/parse_expressions.rs::parse_builtin_commands
 
 <external-call>   ::= "^" <ext-head> { <ext-arg> }
+                    | <unknown-head> { <ext-arg> }  ; no "^": a head that names no command
+<unknown-head>    ::= <ext-string>
+; a bare head that names no declaration (a built-in, keyword or prelude command of the
+; table, or a def/extern/alias in scope: <call-head> matched none), or that
+; names an alias of an external call: nu's parse_call tries a leading ".." range
+; and then calls parse_external_call, so every argument is an <ext-arg> and
+; `git log 0b2d1f4..HEAD` is three external strings. Needs the command table: with none
+; configured every head is an <internal-call>.
+; nu: parse_calls.rs:1588 parse_call (the fall-through after find_longest_decl),
+;     1718 (an alias whose wrapped call is an ExternalCall)
+; here: src/parser/parse_calls.rs::parse_call_lenient, parse_external_arguments;
+;       working_set.rs::find_decl (DeclKind::ExternalAlias)
 <ext-head>        ::= <var-item> | <paren-item>       ; parsed as an expression
                     | <ext-string>
                     | <the empty string>              ; `^` alone parses, fails at run time
@@ -505,13 +521,12 @@ Precedence (nu-protocol `ast/operator.rs:256`; higher binds tighter):
                     | <ext-string>
 ; a "[" argument goes to parse_list_expression alone, which needs the item to END
 ; with "]": `^cmd [a].x`, `^cmd [a].0`, `^cmd ...[a].x` are Unclosed("]"), while
-; `^cmd (ls).name` and `^cmd {a: 1}.a` parse. The same holds for an unknown bare
-; head, which is an external command for nu (`se [a].0`).
+; `^cmd (ls).name` and `^cmd {a: 1}.a` parse. The same holds after an <unknown-head>
+; (`se [a].0`).
 ; nu: parse_calls.rs:375 parse_external_call, 347 parse_external_arg, 362;
 ;     parse_expressions.rs:115 parse_list_expression
 ; here: src/parser/parse_calls.rs::parse_external_call, parse_external_arg,
-;       check_external_list_argument (for an unknown bare head only when a command table
-;       is configured)
+;       check_external_list_argument
 
 <ext-string>      ::= <raw-string>
                     | <bare-glob>                     ; no quote, paren or backtick in it
@@ -538,7 +553,7 @@ Precedence (nu-protocol `ast/operator.rs:256`; higher binds tighter):
 <call-head>       ::= <word> { " " <word> }
 ; the LONGEST run of leading words naming a known declaration (`str trim`,
 ; `overlay use`, `attr example`); an alias head may be followed by subcommand
-; words of the aliased command. A quoted word is never a head (`"ls" -l` is a
+; words of the aliased command. A head naming no declaration is an <unknown-head>. A quoted word is never a head (`"ls" -l` is a
 ; math-expression error) because is_math_expression_like fires on the quote.
 ; nu: parse_calls.rs:1838 find_longest_decl_with_prefix
 ; here: src/parser/parse_calls.rs::find_longest_decl (longest known name, at most 5 words,
@@ -909,8 +924,17 @@ signature driven (`; nu: parse_literals.rs:1246 parse_path_like`; `; here: consu
 ; here: src/parser/parse_expressions.rs::parse_closure_expression
 
 <block>           ::= "{" <block-tokens> "}"       ; a leading "|" is "expected block but found closure"
-; nu: parse_expressions.rs:411 parse_block_expression
-; here: src/parser/parse_expressions.rs::parse_block_body, parse_block_expression
+; where a keyword wants a <block> or a closure (if, while, loop, for, try, catch,
+; finally) nu also takes a <variable>, a subexpression, and a "{" item whose second
+; token (probed as in 5.13, a tail such as `.a` included) is ":": a record or a
+; cell path on one. nu types it any, which passes, unless it is a record whose keys
+; are all plain strings (not raw), which is a type error: `if true { $env.A:b }` and
+; `try {a: 1}.a` parse, `if true {a: 1}` does not
+; nu: parse_expressions.rs:411 parse_block_expression; parse_literals.rs:547
+;     parse_brace_expr; parse_expressions.rs:1943 parse_record (its type)
+; here: src/parser/parse_expressions.rs::parse_block_body, parse_block_expression,
+;       parse_brace_record, is_typed_record;
+;       src/parser/parse_keywords.rs::parse_block_or_value_argument, parse_brace_value
 ```
 
 ### 5.14 Lists and tables
@@ -1125,10 +1149,18 @@ Vocabulary: `<expression>` is a `<pipeline-element>` (3.1); `<block>` is a
 ; (the parameters are then replaced by the signature) and `{a: 1}` is code (a call
 ; to `a:`). Because the signature takes every item but the last, `def foo [] {} extra`
 ; fails on `extra` as the body while `def foo [] {} {}` drops the first `{}`.
-; `--wrapped` needs a `...rest` param that is untyped or typed `string`.
-; nu: parse_calls.rs:1424-1449, 1467; parse_def.rs:585-628; nu-cmd-lang def.rs:21
+; `--wrapped` needs a `...rest` param that is untyped or typed `string`. An untyped
+; one gets the shape external_arg, found on the text (a `:` after `...name`), so
+; a call to the command takes <ext-arg>s: `f 'x'$` and `f 0b2` parse, from the
+; predeclaration on and through an alias of the command. Here every argument of
+; such a call is an <ext-arg>; nu gives the positionals before the rest their own
+; shapes (consumer, 9.4).
+; nu: parse_calls.rs:1424-1449, 1467; parse_def.rs:25 rest_param_is_type_annotated,
+;     52 parse_def_predecl, 585-628; parse_calls.rs:111 parse_unknown_arg;
+;     nu-cmd-lang def.rs:21
 ; here: src/parser/parse_def.rs::parse_def, parse_def_body (the `|x|` parameters are kept
-;       as Def::body_params), check_wrapped_signature
+;       as Def::body_params), check_wrapped_signature, parse_def_predecl and
+;       has_untyped_rest (DeclKind::Wrapped); src/parser/parse_calls.rs::parse_call_lenient
 
 <extern>          ::= "extern" <def-name> <full-signature>
 ; The signature argument takes every remaining item, so a body (the former
@@ -1159,6 +1191,8 @@ Vocabulary: `<expression>` is a `<pipeline-element>` (3.1); `<block>` is a
 ; nu: parse_alias.rs:63 parse_alias, 186-250, 300-306
 ; here: src/parser/parse_alias.rs::parse_alias (the same three checks; missing positionals
 ;       of a keyword target are forgiven as in nu, `alias x = overlay new`)
+; DIFF 1: a missing positional nested in the target is not forgiven here
+;         (`alias i = if if x y`), see 9.2
 ```
 
 ### 6.5 Modules
@@ -1173,10 +1207,15 @@ Vocabulary: `<expression>` is a `<pipeline-element>` (3.1); `<block>` is a
 <module>          ::= "module" <module-name> [ "{" <module-body> "}" ]
 <module-name>     ::= <string>                 ; a literal only: "{...}" is a type error,
                                                ; "$x", "(..)" and $"..." are "not a string"
-; nu: parse_module.rs:868 parse_module, 936
-; here: src/parser/parse_module.rs::parse_module, parse_module_name
+; with "--help" or "-h" anywhere before a "--" the statement is a help call, in which
+; nu parses the name as a <string> and never the item in the body's place: `module x
+; {ls} --help` and `module x --help {}#` parse, a third item is ExtraPositional
+; nu: parse_module.rs:868 parse_module, 936; parse_calls.rs:1382 FirstK
+; here: src/parser/parse_module.rs::parse_module, parse_module_name,
+;       parse_module_help_call
 
-<module-body>     ::= { <module-item> }
+<module-body>     ::= { <module-item> }         ; lexed as it is, with no brace probe (5.13):
+                                               ; `module m { |def x [] {} }` has a leading pipe
 <module-item>     ::= <def> | <extern> | <export> | <attribute-block>
                     | <const> | <alias> | <use> | <module> | <export-env>
 ; anything else (`let`, `mut`, a call, `if`, a pipeline of > 1 command) is
@@ -1238,6 +1277,7 @@ Vocabulary: `<expression>` is a `<pipeline-element>` (3.1); `<block>` is a
 <while>           ::= "while" <math-expression> <block>
 <loop>            ::= "loop" <block>
 ; the condition is every item before the last; a record body is a type error
+; unless nu types it any (5.13 <block>)
 ; nu: nu-cmd-lang while_.rs, loop_.rs (parsed by parse_call)
 ; here: src/parser/parse_control_flow.rs::parse_while, parse_loop,
 ;       src/parser/parse_keywords.rs::parse_block_argument
@@ -1275,8 +1315,8 @@ Vocabulary: `<expression>` is a `<pipeline-element>` (3.1); `<block>` is a
 <handler>         ::= ( "catch" | "finally" ) <closure-value>
 <closure-value>   ::= <closure> | <variable> | "(" <block-tokens> ")"   ; must be a closure (type)
 ; both optional slots accept either keyword: `finally {} catch {}` and even
-; `catch {} catch {}` parse; a third handler is ExtraPositional; a record or a bare
-; word is an error
+; `catch {} catch {}` parse; a third handler is ExtraPositional; a bare word or a
+; record whose keys are all plain strings is an error (5.13 <block>)
 ; nu: nu-cmd-lang try_.rs (OneOf(Keyword catch, Keyword finally) twice)
 ; here: src/parser/parse_control_flow.rs::parse_try, parse_try_handler (the closure type
 ;       of a variable or subexpression: consumer)
@@ -1542,8 +1582,8 @@ constant evaluation and is the consumer's.
 ```ebnf
 <row-condition>   ::= <closure>
                     | <math-expression>
-; the whole span is first tried as a closure (`{|x| ..}`, `{ .. }`, `{}`); otherwise
-; it is a math expression with a fresh `$it` in scope in which every bare-string
+; the whole span is first tried as a closure (`{|x| ..}`, `{ .. }`, `{}`); otherwise,
+; as for a brace item with a tail (`{}.a`, `{a: 1}.a`, 5.13), it is a math expression with a fresh `$it` in scope in which every bare-string
 ; operand, also under `not`, becomes a cell path on `$it` (`size` -> `$it.size`).
 ; A plain `$var` or a cell path on another variable is returned as-is (a closure at
 ; run time); anything else must be bool-typed (TypeMismatch otherwise). `where` is
@@ -1573,123 +1613,74 @@ get nu-parser's full behaviour; none of it is decidable from the text alone.
 | constant-ness of default values, completers, match value patterns, `use` heads, `source` paths; whether a completer's or attribute's command exists | const-eval, declarations | `Parameter::default`, `Parameter::completer`, `Pattern::Expression`, `Use::module`, `Attribute::name` |
 | `where` bool typing, `try` handler types, column-name types, the type of an assignment or a typed `let` | types | `Where`, `Handler`, `Table`, `Assignment`, `Binding` |
 | module, file, overlay and plugin resolution; variable existence | files, module table, scope | `Call` heads, `Var` |
-| `ExternalResolved` vs unknown command | command table | unknown heads are `Call` |
+| the commands a `use`d module brings into scope (`use std/log; log info`) | module resolution | `ParseConfig::add_commands`; without them such a head is an `ExternalCall` |
 
-## 9. Verified differences between nu-parser and this crate: 0 open
+## 9. Verified differences between nu-parser and this crate: 1 open
 
-| section | kind of difference | open as of 2026-09-24 |
-| --- | --- | --- |
-| 9.1 | nu-parser rejects, this crate accepts | **0** |
-| 9.2 | nu-parser accepts, this crate rejects | **0** |
-| 9.3 | both accept, but the parse differs | **0** |
-| 9.4 | needs a signature, a declaration, const-eval, a type or a file | not a grammar difference: the consumer's checks, listed for completeness |
+Last verified on 2026-09-26 against nushell `7de074cfe` and `nu` 0.115.2.
+
+| section | kind of difference | closed | open |
+| --- | --- | --- | --- |
+| 9.1 | nu-parser rejects, this crate accepts | 31 | **0** |
+| 9.2 | nu-parser accepts, this crate rejects | 29 | **1** |
+| 9.3 | both accept, but the parse differs | 11 | **0** |
+| 9.4 | needs a signature, a declaration, const-eval, a type or a file | | not a grammar difference: the consumer's checks, listed below |
+
+Of the 71 closed rows, 40 were closed on 2026-09-24 and 31 on 2026-09-25 and
+2026-09-26. Each is pinned by a fixture under `tests/fixtures/accept` or
+`tests/fixtures/reject`; the git log has the details.
 
 Method: every input was run through `nu-check` on the PATH `nu` 0.115.2
 (and, for the syntactic cases, through `nu-parser-check` built from nushell
 `main` in `tools/nushell-harness`) and through `cargo run --example parse`.
-Differences that nu reports only through type checking, constant evaluation,
-signatures or module resolution are in 9.4, not counted as grammar gaps.
-
-Every row that 9.1, 9.2 and 9.3 ever held was closed on 2026-09-24: each one
-is now a fixture under `tests/fixtures/accept` or `tests/fixtures/reject`
-(compared against nu by `tools/scripts/fixtures-compare.nu`), and the
-differential harness with mutation fuzzing (`tools/scripts/verify.nu`) reports
-no syntactic disagreement over the fixtures, the corpus, nu-std, nushell's own
-tests, nu_scripts, the command examples and the book. The bullet lists under
-9.1 to 9.3 are **history, not open items**: they record what was closed so
-that a regression can be recognised, and the rule numbers point at the
-sections whose `; here:` annotations name the code.
+The harness's nu-parser runs in the `nu` binary's engine (the commands of
+nushell's `command_context.rs`, with its default features), and this crate's
+command table is generated from that engine (`tools/scripts/gen-builtin-commands.nu`),
+so both know the same commands. The harness keeps no list of tolerated
+differences; every disagreement it finds is counted and printed. Over the
+fixtures, the corpus, nu-std, nushell's own tests, nu_scripts, the command
+examples and the book it finds no syntactic disagreement, nor over their
+mutants with seed 1; seeds 2 to 10 find only rows of 9.4's classes and the
+open row of 9.2. Differences that nu reports only through type checking,
+constant evaluation, signatures or module resolution are in 9.4, not counted
+as grammar gaps.
 
 ### 9.1 nu-parser rejects, this crate accepts: 0 open
 
-**No difference known.** Closed on 2026-09-24, each pinned by a fixture under
-`tests/fixtures/reject`:
+None known.
 
-- 2: `ls |` followed by a comment and no final newline (the block-level
-  trailing-pipe check).
-- 3.1, 6.1: `let`/`mut`/`const` and the statement keywords after a `|` or after
-  env shorthand; `hide`/`source`/`overlay`/`plugin use` before a `|`; redirections
-  on them (an `overlay` redirection is refused before its arguments are read).
-- 3.3: an unknown bare command in an assignment rhs (when a command table is
-  configured).
-- 4: a `[` argument of an external command, or of an unknown bare head with a
-  command table configured, that does not end with `]` (`^cmd [a].x`).
-- 5.1: radix prefixes with bad digits (`0x[13]=`, `0xzz`); `true`/`false`/`null`
-  where a string shape is required (`module true {}`, typed defaults).
-- 5.11: a bare cell-path member containing `(`.
-- 5.13, 6.6: a `key:` record where a block is required (`if true {a: 1}`); a record
-  as a `catch` handler.
-- 5.14: `;` and `||` in lists; table rows with the wrong column count; column names
-  that are not strings; `[[a b];]`.
-- 5.15: `{a: =}`, `{a: o>}`.
-- 6.1: multi-word keywords as definition names (`def "export def"`); `--help` and
-  `--` at positional boundaries (the whole rule in 6.1, including what follows
-  them); a `-x` flag a keyword does not have (`return -1`, `match -1 {}`).
-- 6.6, 7.4: `for x in []` and `for x --help in []` (the block's item is reserved);
-  `for x: int --help in [] {}` (the type runs up to `in`).
-- 6.2: `mut x`, `const x` without a value.
-- 6.3: `def $x`, `def (foo)`, `def [foo]`, `def foo[]`; `def foo [] {} {} --help`;
-  duplicate `def`/`extern` names in one block; `--wrapped` without a string rest.
-- 6.4: aliases to the unaliasable keywords; bare alias names starting with `-`.
-- 6.5: a record as a module name; `use std null`, `use std 5`.
-- 6.7: attributes before `export alias`/`const`/`module`/`use`; `@` and `@ name`.
-- 7.1: `-.`, `--` and `-x` with a non-identifier letter as short flags; an empty
-  shape before `@`; `bool` on a flag; a rest parameter with a default; a completer
-  split at the first `@` anywhere; RequiredAfterOptional; MultipleRestParams;
-  reserved parameter names; defaults parsed with the declared shape.
-- 7.6: `;` in a record pattern; reserved names in patterns.
+### 9.2 nu-parser accepts, this crate rejects: 1 open
 
-### 9.2 nu-parser accepts, this crate rejects: 0 open
-
-**No difference known.** Closed on 2026-09-24, each pinned by a fixture under
-`tests/fixtures/accept`:
-
-- 2: `@foo` after a `|` is a command head; `|` and `b` inside an attribute line are
-  words of the attribute.
-- 3.3: any FullCellPath, list, table or `key:` record as an assignment lhs.
-- 5.6: `"\xC3\xA9"` (raw bytes, checked as UTF-8 afterwards).
-- 5.10: `(ls).0..5`.
-- 6.3: `def foo [] {|x| }` (the body is a closure), `def foo [] : {}`, `def foo []
-  {} {}`, `extern foo [] {}`, `extern foo [x = 0x]` (the dropped items are ignored
-  text, see below).
-- 6.4: `alias x = FOO=1 ls`, `alias x = overlay new`, `export alias x =`.
-- 6.5: `export-env {} extra`, `export-env {} {}`, a redirection on `export-env`.
-- 6.6: `if true {} else {|x| }`; `match 1 {|x| }`, `match 1 {a: 1}`, `match 1 $x`,
-  `match 1 (ls)` (kept as `Match::value_block`); `try {} --`, `try {} catch {} --`.
-- 7.1: `def foo [o> x] {}`; `[x: # c\n]`; `[x = # c\n y]`.
-- 7.2: `record<a: int,, b: int>`, `record<, a: int>`.
-- 7.4: `for x: record<a: int, b: string> in [] {}` (a type of several items).
-- 7.5: `use std [math].x`, `use std $x`, `use std [1 2]`.
-- 7.6: `[1 | 2]` and `[..foo]` as list patterns.
+An alias target whose first error is a missing positional nested inside it
+(`alias i = if if x y`, `alias i = if (if x) {}`, `alias i = if 1 + if x y`).
+nu parses the target, and when the first of its errors is a
+MissingPositional, anywhere in it, drops them all; here that is the inner
+`if`'s missing block. This crate stops at its first error, which carries no
+missing-positional kind (the "missing" errors are `expected ...` diagnostics
+from about 25 places, some split differently from nu's positional
+allocation: `if x` is "expected condition" here, a missing block for nu),
+and it has no node for a target that nu accepts but that does not parse.
+Closing it needs both: an `ErrorKind::MissingPositional` at those places and
+a garbage target in `Alias`. The top-level case is handled
+(`parse_aliased_keyword`: `alias i = if x`). Found by mutation fuzzing; no
+real script is known to hit it.
 
 ### 9.3 Both accept, but the parse differs: 0 open
 
-**No difference known.** Closed on 2026-09-24, each pinned by a fixture whose
-golden `.ast` shows the nu parse:
-
-- 1.1: a top-level comment on a CRLF line includes the `\r`.
-- 2: a blank line closes a pipeline even before a `|` (`[1 2 3]\n\n| $in` is two
-  pipelines; `mut x = 2\n$x = 5\n\n| 3` assigns `5`); a leading `|` and then a blank
-  line is no pipeline at all.
-- 5.4: `2023-02-30` is a string (the calendar is checked).
-- 5.6: `` `a`b `` keeps its backtick.
-- 7.1: several doc comments on one parameter are all kept (`Parameter::description`).
-- 7.5: `use std $x` and `use std [1 2]` drop those members.
-- 7.6: `[1 ..$r 2]` stops at the rest; record-pattern fields are verbatim (`"a"`
-  never matches `a`).
-- 7.7: `where --help` is a help call.
-- 5.14, 6.3, 6.5, 7.5, 7.6: text that nu accepts and then never looks at (a
-  redirection in a list, the second brace item of a def or extern signature, an
-  extern default, `export-env`'s extra items, dropped `use` members, list-pattern
-  items after the rest, a consumed `--`) is reported as `Ast::ignored` spans
-  (`FlatShape::Ignored`) so that a consumer can see it.
+None known outside 9.4.
 
 ### 9.4 Differences that need signatures, declarations, const-eval or files (consumer by design)
 
 All verified with 0.115.2; nu rejects and this crate accepts unless noted. The
 keyword commands (6.5) and the built-in attributes have fixed signatures and are
 checked here; everything below concerns ordinary commands or needs more than the
-text.
+text. The mutation fuzzer (`differential --mutants 3 --seed N`) keeps finding
+rows of these classes that nu-parser reports as syntax errors, because the
+variant is syntactic although the decision needs more than the text: `use eggs
+foo    foo` after inline `module spam { export const foo = 3 }` and `module eggs
+{ export use spam foo }` (WrongImportPattern: `foo` is a constant, not a
+submodule), and `2 | skip 0x[01 23 45 67]` (InvalidLiteral: `skip` takes an
+`int`).
 
 - Positional counts and shapes of ordinary commands: `str foo`, `collect 1`, `def f
   [x] {}; f 1 2`, `f 1.0` for an `int` parameter, `f true` / `f null` for a `string`
@@ -1719,10 +1710,47 @@ text.
   `use std a *` where `a` is not a submodule, `use eggs foo foo` where `foo` is not
   a module, `use -- x`, `hide std *`, `overlay hide zero`, `plugin use x` with no
   such plugin, `source x.nu` with no such file.
-- The command table: `^` required for external commands in an assignment rhs,
-  `%name` must be a built-in, and the `[`-argument rule of an unknown bare head
-  (`cmd [a].0`, 4) are checked only when the consumer configures the table
-  (`ParseConfig`).
+- The command table: whether a head is an external command (4), with what
+  follows from it (`^` required in an assignment rhs, external arguments,
+  `cmd [a].0` unclosed), and whether `%name` is a built-in are decided only when
+  a table is configured (`ParseConfig`; `ParseConfig::new()` has the commands
+  of a fresh `nu`).
+- The commands a `use`d module brings into scope: after `use std/log` or
+  `module m { export def f [] {} }; use m`, nu resolves `log info` and `m f`
+  as calls; without them in the `ParseConfig` (`add_commands`), such a head
+  is an `ExternalCall` here (both accept; the tree differs).
+- Variable existence decides a leading range: nu reads `..$x` as a range when
+  `$x` exists and as an external command when it does not; here it is always
+  a range (`..$$ a` and `..$x# a` go the other way: nu accepts them as
+  externals when the variable does not exist). The same decides an env
+  shorthand: `FOO=$1` alone is an external command for nu when `$1` does not
+  exist, and a shorthand without a command here.
+- Commands a `use`d module brings into scope, when nu checks their arguments by
+  signature: `use std/log; log info "x"=`, `use std/assert; assert equal
+  'a'"a"`. And import patterns that need the module's contents: `use eggs foo
+  foo` after inline modules, `use std/math PI PI`, `use m "sub cmd" "sub cmd"`.
+- A `use` of a file that is not a module: nu opens and parses it (`use
+  ~/.cargo/bin/nu_plugin_query` reads a binary).
+- The other way round, and so not something a consumer can add: a positional
+  of an ordinary command whose signature wants a glob or a string takes any
+  word in nu, so `ls 0b2` and `ls [a-d]:1` are accepted by nu and rejected
+  here (`echo 0b2` and `echo [a-d]:1`, whose positional is `any`, are
+  rejected by both), like `f 0xzz` for a `string` parameter above. The
+  mutation fuzzer finds more of these for built-in shapes: `glob
+  "[!cCbMs]*"#`, `glob "**/*.txt": --follow-symlinks`, `bytes split 0x$[20]`,
+  `run-external "echo"..`; and the int shape the other way (`skip`, `first`,
+  `last`, `take`, `drop`, `chunks` with `0x[..]`, `bytes add --index 0x[AA
+  BB]`, `bits shr 0x[4f f4]`, `bytes at ..-4 ..-4`), cell-path shapes (`get
+  home!] path!`, `group-by foo?$`) and `into sqlite [[name]; ...]`. The same
+  goes for custom commands of the file: `def f [x: int] {}; f "a"`, `f {a: 1}`
+  where a string is wanted, an extra positional, and a positional before the
+  rest of a wrapped command (`def --wrapped f [x = "a", ...r] {}; f 'x'$`, where
+  nu parses `'x'$` with the shape of `x` and this crate as an external argument;
+  in `[...r string]` the `string` is such a positional).
+  `do {a: 1}` is the built-in form of this: a record where a closure is wanted.
+- A record spread whose variable nu has typed as a record keeps the record's
+  type (`let r = {b: 2}; if true { a: 1, ...$r }` is a type error in nu); here a
+  spread of a variable is typed `any` (5.13 <block>).
 
 ### 9.5 Cross-check against two independent grammars
 
@@ -1748,10 +1776,10 @@ sigil calls, `..=`, `has`/`not-has`, raw strings, the `external_arg` type,
   commands and `parse_*` functions (`src/docs/11-traceability.md`); update the
   affected rule here and its `; nu:` line at the same time.
 - A new difference goes into 9.1, 9.2 or 9.3 with a `; DIFF n` marker on its
-  rule, and the counts at the top of section 9 move off 0. When it is fixed it
-  becomes a fixture under `tests/fixtures/{accept,reject}`, moves to the
-  closed list of its section, and the marker goes away, so that the counts
-  read 0 again.
+  rule, and its open count in the table at the top of section 9 goes up. When
+  it is fixed it becomes a fixture under `tests/fixtures/{accept,reject}`, its
+  entry and the marker go away, the open count goes down and the closed count
+  up, and the date is updated. The git log keeps the details, not this file.
 
 ## Appendix A. Character classes and shared vocabulary
 

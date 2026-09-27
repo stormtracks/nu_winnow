@@ -8,4 +8,5 @@ Block 0..19
         Pipeline 11..18
           Int 1 11..12
           | 13..14
-          Call `git` 15..18
+          ExternalCall 15..18
+            String Bare "git" 15..18

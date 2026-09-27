@@ -139,11 +139,12 @@ fn parse_unit_value<'u, U: Copy>(
     }
     let normalized: Cow<'_, str> = if uppercase { Cow::Owned(text.to_ascii_uppercase()) } else { Cow::Borrowed(text) };
     let (name, unit) = units.iter().find(|(name, _)| normalized.ends_with(name))?;
-    let number = &text[..text.len() - name.len()];
+    // Like nu, the check for a variable before the unit (`$x..1kb`) comes
+    // after the underscores are stripped, so `42m$_b` is no filesize either.
+    let number = strip_underscores(&text[..text.len() - name.len()]);
     if number.ends_with('$') {
         return None;
     }
-    let number = strip_underscores(number);
     match number.parse::<f64>() {
         Ok(value) => Some(Ok((value, *unit))),
         Err(_) => Some(Err("value must be a number")),
@@ -770,10 +771,16 @@ fn expected_after_path_member(member: &PathMember<'_>, span: Span) -> ErrMode<Pa
     cut(Diagnostic::expected(what, span))
 }
 
-/// The items of `span` lexed as a cell path.
+/// The items of `span` lexed as a cell path. Like nu, every token counts, so
+/// an `=` or an `o>` is a member or a misplaced one (`$x.a?=` fails), never
+/// dropped.
 fn lex_cell_path(working_set: &WorkingSet<'_>, span: Span) -> ParseResult<Vec<Token>> {
     let lexed = lex(working_set.get_span_contents(span), span.start, LexOptions::CELL_PATH).map_err(cut)?;
-    Ok(lexed.into_iter().filter(|token| token.contents == TokenContents::Item).collect())
+    Ok(lexed
+        .into_iter()
+        .filter(|token| !matches!(token.contents, TokenContents::Eof | TokenContents::Eol | TokenContents::Comment))
+        .map(|token| Token { contents: TokenContents::Item, span: token.span })
+        .collect())
 }
 
 /// Positions of the range operators (`..`) at parenthesis depth zero:
@@ -818,24 +825,94 @@ fn is_range_bound(text: &str) -> bool {
 /// number-like. Decided without parsing, so callers can fall through to the
 /// next literal kind (`cd ..`, `a..b`) when it is not.
 pub fn is_range_syntax(text: &str) -> bool {
-    if !text.contains("..") || text.starts_with("...") {
-        return false;
+    // Most items hold no `..`; answer those without a call.
+    has_range_operator(text)
+        && range_bounds(text).is_some_and(|(from, next, to)| {
+            (from.is_empty() || is_range_bound(from))
+                && next.is_none_or(|next| !next.is_empty() && is_range_bound(next))
+                && (to.is_empty() || is_range_bound(to))
+        })
+}
+
+/// Whether `text` holds `..` anywhere: a byte scan, cheaper on the short items
+/// it is asked about than a substring search.
+#[inline]
+fn has_range_operator(text: &str) -> bool {
+    text.as_bytes().windows(2).any(|pair| pair == b"..")
+}
+
+/// Whether a command head is a range (nu's `is_math_expression_like`, which
+/// asks `parse_range` for a range without an error): [`is_range_syntax`] with
+/// no bare `$` bound. As a head, `..$` is then an external command; as a value
+/// it is still a range, whose `$` is an incomplete variable.
+#[inline]
+pub fn is_range_head(text: &str) -> bool {
+    // A `$` bound must name a variable and a cell path on it (`..$x.a`);
+    // `..$`, `1..$s=`, `1..$s!` and `..$x.c!!` are no range for nu, whose
+    // value parser fails on them.
+    let bound_parses = |bound: &str| match bound.strip_prefix('$') {
+        Some(rest) => {
+            let name_end = rest.find(['.', '?', '!']).unwrap_or(rest.len());
+            is_identifier(&rest[..name_end]) && is_cell_path_tail(&rest[name_end..])
+        }
+        None => true,
+    };
+    is_range_syntax(text)
+        && range_bounds(text)
+            .is_some_and(|(from, next, to)| bound_parses(from) && next.is_none_or(bound_parses) && bound_parses(to))
+}
+
+/// Whether `tail`, the text after a variable's name, is a cell path that
+/// [`parse_full_cell_path`] accepts: `.member` accesses, each with at most one
+/// `?` and one `!` after it (`$x.a?.b!`, not `$x.c!!`), no negative index and
+/// no bare `(` in a member. A quoted member may hold any character.
+fn is_cell_path_tail(tail: &str) -> bool {
+    let mut rest = tail;
+    while let Some(member) = rest.strip_prefix('.') {
+        let end = match member.as_bytes().first() {
+            Some(&quote @ (b'"' | b'\'' | b'`')) => match member[1..].find(char::from(quote)) {
+                Some(close) => close + 2,
+                None => return false,
+            },
+            _ => member.find(['.', '?', '!']).unwrap_or(member.len()),
+        };
+        let text = &member[..end];
+        if parse_int(text).is_some_and(|index| index < 0) || is_bare_string_interpolation(text) {
+            return false;
+        }
+        let (mut optional, mut case_insensitive) = (false, false);
+        rest = &member[end..];
+        loop {
+            match rest.as_bytes().first() {
+                Some(b'?') if !optional => optional = true,
+                Some(b'!') if !case_insensitive => case_insensitive = true,
+                _ => break,
+            }
+            rest = &rest[1..];
+        }
     }
-    let Some((next_operator, operator)) = find_range_operators(text) else { return false };
+    rest.is_empty()
+}
+
+/// The `from`, `next` and `to` texts of a range-shaped `text` (empty for an
+/// absent bound), or `None` when its operators do not make a range.
+fn range_bounds(text: &str) -> Option<(&str, Option<&str>, &str)> {
+    if !has_range_operator(text) || text.starts_with("...") {
+        return None;
+    }
+    let (next_operator, operator) = find_range_operators(text)?;
     let operator_length =
         if text[operator..].starts_with("..<") || text[operator..].starts_with("..=") { 3 } else { 2 };
     if text.find("..<").is_some_and(|position| position != operator) {
-        return false;
+        return None;
     }
     let from = &text[..next_operator.unwrap_or(operator)];
     let next = next_operator.map(|next_operator| &text[next_operator + 2..operator]);
     let to = &text[operator + operator_length..];
     if from.is_empty() && to.is_empty() {
-        return false;
+        return None;
     }
-    (from.is_empty() || is_range_bound(from))
-        && next.is_none_or(|next| !next.is_empty() && is_range_bound(next))
-        && (to.is_empty() || is_range_bound(to))
+    Some((from, next, to))
 }
 
 /// A range item (nu's `parse_range`); the caller has checked [`is_range_syntax`].

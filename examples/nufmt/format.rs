@@ -564,15 +564,19 @@ impl<'a> Formatter<'a> {
     /// `true` if a call in the pipeline has arguments on more than one line.
     fn args_multiline(&self, p: &Pipeline<'a>) -> bool {
         p.elements.iter().any(|e| match &e.expr.expr {
-            Expr::Call(c) => {
-                let mut prev = c.head.span.end;
-                c.arguments.iter().any(|a| {
-                    let split = self.multiline_between(prev, a.span().start);
-                    prev = a.span().end;
-                    split
-                })
-            }
+            Expr::Call(c) => self.split_after(c.head.span, c.arguments.iter().map(Argument::span)),
+            Expr::ExternalCall(c) => self.split_after(c.head.span, c.arguments.iter().map(ExternalArgument::span)),
             _ => false,
+        })
+    }
+
+    /// `true` if a line break separates two consecutive spans, starting at `head`.
+    fn split_after(&self, head: Span, mut spans: impl Iterator<Item = Span>) -> bool {
+        let mut prev = head.end;
+        spans.any(|span| {
+            let split = self.multiline_between(prev, span.start);
+            prev = span.end;
+            split
         })
     }
 
@@ -951,17 +955,7 @@ impl<'a> Formatter<'a> {
         let mut indented = false;
         for arg in args {
             let span = arg.span();
-            if let Some(end) = prev_end
-                && self.multiline_between(end, span.start)
-            {
-                self.trailing_comments(end);
-                self.newline();
-                if !indented {
-                    self.indent += 1;
-                    indented = true;
-                }
-                self.flush_comments(span.start);
-            }
+            self.arg_line_break(prev_end, span.start, &mut indented);
             prev_end = Some(span.end);
             match arg {
                 Argument::Positional(e) => self.expr(e),
@@ -984,6 +978,42 @@ impl<'a> Formatter<'a> {
         }
         if indented {
             self.indent -= 1;
+        }
+    }
+
+    /// The arguments of an external call, laid out like [`Self::args`].
+    fn external_args(&mut self, mut prev_end: Option<usize>, args: &[ExternalArgument<'a>]) {
+        let mut indented = false;
+        for arg in args {
+            let span = arg.span();
+            self.arg_line_break(prev_end, span.start, &mut indented);
+            prev_end = Some(span.end);
+            match arg {
+                ExternalArgument::Regular(e) => self.expr(e),
+                ExternalArgument::Spread { expr, .. } => {
+                    self.word("...");
+                    self.glued(|f| f.expr(expr));
+                }
+            }
+        }
+        if indented {
+            self.indent -= 1;
+        }
+    }
+
+    /// Keep an argument on its own line when the source put it there, the
+    /// continuation lines indented once.
+    fn arg_line_break(&mut self, prev_end: Option<usize>, start: usize, indented: &mut bool) {
+        if let Some(end) = prev_end
+            && self.multiline_between(end, start)
+        {
+            self.trailing_comments(end);
+            self.newline();
+            if !*indented {
+                self.indent += 1;
+                *indented = true;
+            }
+            self.flush_comments(start);
         }
     }
 
@@ -1335,17 +1365,15 @@ impl<'a> Formatter<'a> {
                 self.args(Some(d.head.span.end), &d.arguments);
             }
             Expr::ExternalCall(c) => {
-                self.word("^");
-                self.glued(|f| f.expr(&c.head));
-                for arg in &c.arguments {
-                    match arg {
-                        ExternalArgument::Regular(e) => self.expr(e),
-                        ExternalArgument::Spread { expr, .. } => {
-                            self.word("...");
-                            self.glued(|f| f.expr(expr));
-                        }
-                    }
+                if c.caret.is_some() {
+                    self.word("^");
+                    self.glued(|f| f.expr(&c.head));
+                } else if c.arguments.is_empty() && self.repair_packed_if(c.head.span) {
+                    return;
+                } else {
+                    self.expr(&c.head);
                 }
+                self.external_args(Some(c.head.span.end), &c.arguments);
             }
             Expr::EnvShorthand(e) => {
                 for v in &e.vars {
@@ -1436,7 +1464,7 @@ impl<'a> Formatter<'a> {
                 self.word("if");
                 self.condition(&i.condition);
                 let then_end = i.else_branch.as_ref().map_or(span.end, |e| e.keyword.start);
-                self.braced_block(&i.then_block, Span::new(i.condition.span.end, then_end), false);
+                self.block_or_value(&i.then_block, Span::new(i.condition.span.end, then_end), i.then_value.as_deref());
                 if let Some(e) = &i.else_branch {
                     self.word("else");
                     self.expr(&e.body);
@@ -1451,16 +1479,16 @@ impl<'a> Formatter<'a> {
                 }
                 self.word("in");
                 self.expr(&f.iterable);
-                self.braced_block(&f.body, Span::new(f.iterable.span.end, span.end), false);
+                self.block_or_value(&f.body, Span::new(f.iterable.span.end, span.end), f.body_value.as_deref());
             }
             Expr::While(w) => {
                 self.word("while");
                 self.condition(&w.condition);
-                self.braced_block(&w.body, Span::new(w.condition.span.end, span.end), false);
+                self.block_or_value(&w.body, Span::new(w.condition.span.end, span.end), w.body_value.as_deref());
             }
             Expr::Loop(l) => {
                 self.word("loop");
-                self.braced_block(&l.body, Span::new(span.start + "loop".len(), span.end), false);
+                self.block_or_value(&l.body, Span::new(span.start + "loop".len(), span.end), l.body_value.as_deref());
             }
             Expr::Break => self.word("break"),
             Expr::Continue => self.word("continue"),
@@ -1473,7 +1501,7 @@ impl<'a> Formatter<'a> {
             Expr::Try(t) => {
                 self.word("try");
                 let body_end = t.handlers.first().map_or(span.end, |h| h.keyword.start);
-                self.braced_block(&t.body, Span::new(span.start + "try".len(), body_end), false);
+                self.block_or_value(&t.body, Span::new(span.start + "try".len(), body_end), t.body_value.as_deref());
                 for h in &t.handlers {
                     self.spanned(h.keyword);
                     self.expr(&h.body);
@@ -1486,6 +1514,14 @@ impl<'a> Formatter<'a> {
                 self.row_condition = saved;
             }
             _ => self.spanned(span),
+        }
+    }
+
+    /// A keyword's block, or the variable or subexpression standing in for it.
+    fn block_or_value(&mut self, block: &Block<'a>, outer: Span, value: Option<&Expression<'a>>) {
+        match value {
+            Some(value) => self.expr(value),
+            None => self.braced_block(block, outer, false),
         }
     }
 
